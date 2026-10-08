@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   quality:
@@ -20,15 +20,15 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
       - name: Bench compile
-        run: cargo bench --no-run
+        run: cargo bench --locked --no-run
 
   msrv:
     name: msrv / 1.89
@@ -40,14 +40,4 @@ jobs:
         with:
           key: msrv-1.89
       - name: Check library at declared MSRV
-        run: cargo check --lib
-      - name: Commit resolved dependency lockfile
-        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
-        run: |
-          if [ -n "$(git status --porcelain -- Cargo.lock)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
-            git commit -m "chore: lock dependency graph"
-            git push
-          fi
+        run: cargo check --locked --lib
