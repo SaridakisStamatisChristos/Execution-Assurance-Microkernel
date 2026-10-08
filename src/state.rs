@@ -47,6 +47,7 @@ impl ExecutionState {
                 | (ReconciliationRequired, Aborted)
                 | (Committed, Verified)
                 | (Committed, RollbackPending)
+                | (Committed, Failed)
                 | (Verified, Finalized)
                 | (RollbackPending, RolledBack)
                 | (RollbackPending, Failed)
