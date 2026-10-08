@@ -1,4 +1,4 @@
-use crate::ExecutionState;
+use crate::{CompensationPolicy, ExecutionState};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -7,11 +7,34 @@ use std::{
     sync::Mutex,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryEnvelope {
+    pub action_id: String,
+    pub action_type: String,
+    pub idempotency_key: Option<String>,
+    pub started_at_ms: u64,
+    pub compensation_policy: CompensationPolicy,
+    pub snapshot: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub execution_id: String,
     pub state: ExecutionState,
     pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryEnvelope>,
+}
+
+impl JournalEntry {
+    pub fn state(execution_id: impl Into<String>, state: ExecutionState, at_ms: u64) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            state,
+            at_ms,
+            recovery: None,
+        }
+    }
 }
 
 pub trait Journal: Send + Sync {
@@ -32,6 +55,7 @@ impl Journal for InMemoryJournal {
             .push(entry);
         Ok(())
     }
+
     fn entries(&self) -> Result<Vec<JournalEntry>, String> {
         self.entries
             .lock()
@@ -73,6 +97,7 @@ impl Journal for FileJournal {
         file.flush().map_err(|error| error.to_string())?;
         file.sync_data().map_err(|error| error.to_string())
     }
+
     fn entries(&self) -> Result<Vec<JournalEntry>, String> {
         let file = File::open(&self.path).map_err(|error| error.to_string())?;
         BufReader::new(file)
