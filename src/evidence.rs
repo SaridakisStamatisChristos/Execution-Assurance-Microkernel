@@ -118,11 +118,25 @@ pub struct ExecutionRecord {
 impl ExecutionRecord {
     pub fn seal(mut self) -> Result<Self, serde_json::Error> {
         self.record_hash = None;
-        let canonical = serde_json::to_vec(&self)?;
+        self.record_hash = Some(self.compute_hash()?);
+        Ok(self)
+    }
+
+    /// Recompute and compare the SHA-256 seal without mutating the record.
+    pub fn verify_hash(&self) -> Result<bool, serde_json::Error> {
+        let Some(expected) = self.record_hash.as_ref() else {
+            return Ok(false);
+        };
+        Ok(&self.compute_hash()? == expected)
+    }
+
+    fn compute_hash(&self) -> Result<String, serde_json::Error> {
+        let mut unsigned = self.clone();
+        unsigned.record_hash = None;
+        let canonical = serde_json::to_vec(&unsigned)?;
         let mut hasher = Sha256::new();
         hasher.update(canonical);
-        self.record_hash = Some(format!("{:x}", hasher.finalize()));
-        Ok(self)
+        Ok(format!("{:x}", hasher.finalize()))
     }
 }
 
