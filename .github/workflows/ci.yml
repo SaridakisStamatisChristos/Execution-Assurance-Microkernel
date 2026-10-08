@@ -23,12 +23,17 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets --all-features
+      - name: Doctest
+        run: cargo test --locked --doc --all-features
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
       - name: Bench compile
         run: cargo bench --locked --no-run
+      - name: Benchmark evidence
+        if: github.ref == 'refs/heads/feat/complete-handoff'
+        run: cargo bench --locked --bench kernel -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5 --noplot
 
   msrv:
     name: msrv / 1.89
