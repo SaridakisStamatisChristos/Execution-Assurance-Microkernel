@@ -2,9 +2,9 @@
 
 use execution_assurance_microkernel::{
     Action, CheckRecord, Clock, CommitStatus, CompensationPolicy, EffectPermit, EvidenceStore,
-    FaultInjector, IdGenerator, IdempotencyStore, InMemoryEvidenceStore,
-    InMemoryIdempotencyStore, InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel,
-    NoFaultInjector, Predicate, ReconciliationResult, SequenceIdGenerator,
+    FaultInjector, IdGenerator, IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore,
+    InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate,
+    ReconciliationResult, SequenceIdGenerator,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -155,7 +155,9 @@ impl Action for TestAction {
             CommitBehavior::Confirmed if ctx.commits > 0 => {
                 ReconciliationResult::Committed(ctx.value)
             }
-            CommitBehavior::Confirmed | CommitBehavior::Failed => ReconciliationResult::NotCommitted,
+            CommitBehavior::Confirmed | CommitBehavior::Failed => {
+                ReconciliationResult::NotCommitted
+            }
         })
     }
 

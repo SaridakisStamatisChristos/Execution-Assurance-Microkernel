@@ -101,7 +101,8 @@ impl Action for AtomicReplace {
                 Ok(ReconciliationResult::Committed(Self::hash(&bytes)))
             }
             Ok(_) => Ok(ReconciliationResult::Unresolved {
-                reason: "target exists with content different from proposed replacement".to_string(),
+                reason: "target exists with content different from proposed replacement"
+                    .to_string(),
             }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Ok(ReconciliationResult::NotCommitted)

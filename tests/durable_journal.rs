@@ -11,18 +11,10 @@ fn file_journal_survives_reopen_and_preserves_order() {
     {
         let journal = FileJournal::open(&path).unwrap();
         journal
-            .append(JournalEntry::state(
-                "exec-1",
-                ExecutionState::Prepared,
-                10,
-            ))
+            .append(JournalEntry::state("exec-1", ExecutionState::Prepared, 10))
             .unwrap();
         journal
-            .append(JournalEntry::state(
-                "exec-1",
-                ExecutionState::Committed,
-                11,
-            ))
+            .append(JournalEntry::state("exec-1", ExecutionState::Committed, 11))
             .unwrap();
     }
 

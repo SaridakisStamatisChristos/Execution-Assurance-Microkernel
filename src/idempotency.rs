@@ -89,8 +89,10 @@ impl FileIdempotencyStore {
     }
 
     fn claim_path(&self, namespace: &str, value: &str) -> PathBuf {
-        self.root
-            .join(format!("{namespace}-{}.claim", Self::digest(namespace, value)))
+        self.root.join(format!(
+            "{namespace}-{}.claim",
+            Self::digest(namespace, value)
+        ))
     }
 
     fn create_claim(&self, path: &Path, value: &str) -> Result<bool, String> {

@@ -3,9 +3,9 @@ mod common;
 use common::{kernel_with, TestAction, World};
 use execution_assurance_microkernel::{
     CompensationPolicy, EvidenceStore, ExecutionOutcome, ExecutionRequest, ExecutionState,
-    IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Journal,
-    JournalEntry, NoFaultInjector, RecoveryEnvelope, RecoveryManager, RecoveryPlan,
-    ScriptedFaultInjector, FaultPoint,
+    FaultPoint, IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal,
+    Journal, JournalEntry, NoFaultInjector, RecoveryEnvelope, RecoveryManager, RecoveryPlan,
+    ScriptedFaultInjector,
 };
 use std::sync::Arc;
 
@@ -105,14 +105,9 @@ fn crash_before_commit_recovers_to_aborted_without_effect() {
         .unwrap_err();
     assert_eq!(world.commits, 0);
 
-    let recovered = kernel_with(
-        journal,
-        evidence,
-        ids,
-        Arc::new(NoFaultInjector),
-    )
-    .recover("crash-before-commit", TestAction::default(), &mut world)
-    .unwrap();
+    let recovered = kernel_with(journal, evidence, ids, Arc::new(NoFaultInjector))
+        .recover("crash-before-commit", TestAction::default(), &mut world)
+        .unwrap();
 
     assert_eq!(recovered.outcome, ExecutionOutcome::Aborted);
     assert_eq!(world.commits, 0);
@@ -144,14 +139,9 @@ fn crash_after_rollback_effect_resumes_without_second_rollback() {
     assert_eq!(world.value, 0);
     assert_eq!(world.rollbacks, 1);
 
-    let recovered = kernel_with(
-        journal,
-        evidence,
-        ids,
-        Arc::new(NoFaultInjector),
-    )
-    .recover("crash-after-rollback", action, &mut world)
-    .unwrap();
+    let recovered = kernel_with(journal, evidence, ids, Arc::new(NoFaultInjector))
+        .recover("crash-after-rollback", action, &mut world)
+        .unwrap();
 
     assert_eq!(recovered.outcome, ExecutionOutcome::RolledBack);
     assert_eq!(world.value, 0);
@@ -174,10 +164,18 @@ fn durable_verified_marker_can_be_finalized_after_restart() {
     };
 
     journal
-        .append(JournalEntry::state("verified-restart", ExecutionState::Proposed, 1))
+        .append(JournalEntry::state(
+            "verified-restart",
+            ExecutionState::Proposed,
+            1,
+        ))
         .unwrap();
     journal
-        .append(JournalEntry::state("verified-restart", ExecutionState::Validated, 2))
+        .append(JournalEntry::state(
+            "verified-restart",
+            ExecutionState::Validated,
+            2,
+        ))
         .unwrap();
     journal
         .append(JournalEntry {
@@ -188,10 +186,18 @@ fn durable_verified_marker_can_be_finalized_after_restart() {
         })
         .unwrap();
     journal
-        .append(JournalEntry::state("verified-restart", ExecutionState::Committed, 4))
+        .append(JournalEntry::state(
+            "verified-restart",
+            ExecutionState::Committed,
+            4,
+        ))
         .unwrap();
     journal
-        .append(JournalEntry::state("verified-restart", ExecutionState::Verified, 5))
+        .append(JournalEntry::state(
+            "verified-restart",
+            ExecutionState::Verified,
+            5,
+        ))
         .unwrap();
 
     let kernel = kernel_with(journal.clone(), evidence, ids, Arc::new(NoFaultInjector));

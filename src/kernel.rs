@@ -206,12 +206,7 @@ impl Kernel {
                 return Err(ExecutionError::DuplicateExecutionId(execution_id));
             }
         }
-        self.execute_claimed(
-            request.action,
-            ctx,
-            execution_id,
-            request.idempotency_key,
-        )
+        self.execute_claimed(request.action, ctx, execution_id, request.idempotency_key)
     }
 
     pub fn recover<A: Action>(
@@ -239,7 +234,8 @@ impl Kernel {
             .ok_or_else(|| ExecutionError::RecoveryUnavailable(execution_id.to_string()))?;
         let envelope = directive.recovery.clone();
         if let Some(envelope) = envelope.as_ref() {
-            if envelope.action_id != action.action_id() || envelope.action_type != action.action_type()
+            if envelope.action_id != action.action_id()
+                || envelope.action_type != action.action_type()
             {
                 return Err(ExecutionError::RecoveryMismatch(format!(
                     "journal has {}/{} but supplied action is {}/{}",
@@ -271,7 +267,9 @@ impl Kernel {
         });
 
         match directive.plan {
-            RecoveryPlan::None => Err(ExecutionError::RecoveryUnavailable(execution_id.to_string())),
+            RecoveryPlan::None => Err(ExecutionError::RecoveryUnavailable(
+                execution_id.to_string(),
+            )),
             RecoveryPlan::AbortBeforeCommit => {
                 record.failure = Some(FailureRecord {
                     class: FailureClass::RecoveryFailed,
@@ -283,7 +281,13 @@ impl Kernel {
                 } else {
                     ExecutionState::Aborted
                 };
-                self.finish_terminal(record, &mut trace, terminal, ExecutionOutcome::Aborted, None)
+                self.finish_terminal(
+                    record,
+                    &mut trace,
+                    terminal,
+                    ExecutionOutcome::Aborted,
+                    None,
+                )
             }
             RecoveryPlan::ReconcileBeforeRetry => {
                 let envelope = envelope.ok_or_else(|| {
@@ -291,7 +295,11 @@ impl Kernel {
                 })?;
                 let snapshot = self.decode_snapshot::<A>(&envelope)?;
                 if trace.state() == ExecutionState::Prepared {
-                    self.transition(execution_id, &mut trace, ExecutionState::ReconciliationRequired)?;
+                    self.transition(
+                        execution_id,
+                        &mut trace,
+                        ExecutionState::ReconciliationRequired,
+                    )?;
                 }
                 record.commit = CommitRecord {
                     disposition: CommitDisposition::Unknown,
@@ -646,11 +654,7 @@ impl Kernel {
                     detail: "commit re-established by recovery reconciliation".to_string(),
                 };
                 record.failure = None;
-                self.transition(
-                    &record.execution_id,
-                    &mut trace,
-                    ExecutionState::Committed,
-                )?;
+                self.transition(&record.execution_id, &mut trace, ExecutionState::Committed)?;
                 self.after_commit(action, ctx, &snapshot, output, record, &mut trace)
             }
             Ok(ReconciliationResult::NotCommitted) => {
@@ -788,7 +792,10 @@ impl Kernel {
         }
 
         self.transition(&record.execution_id, trace, ExecutionState::Verified)?;
-        debug_assert!(record.verification.as_ref().is_some_and(|value| value.passed));
+        debug_assert!(record
+            .verification
+            .as_ref()
+            .is_some_and(|value| value.passed));
         debug_assert!(matches!(
             record.commit.disposition,
             CommitDisposition::Confirmed | CommitDisposition::ReconciledCommitted
@@ -831,11 +838,7 @@ impl Kernel {
             );
         }
 
-        self.transition(
-            &record.execution_id,
-            trace,
-            ExecutionState::RollbackPending,
-        )?;
+        self.transition(&record.execution_id, trace, ExecutionState::RollbackPending)?;
         self.fault(FaultPoint::DuringRollback)?;
         let permit = EffectPermit::new();
         if let Err(error) = action.rollback(&permit, ctx, snapshot) {
@@ -1135,7 +1138,10 @@ impl Kernel {
             .map_err(|_| ExecutionError::InjectedFault(format!("{point:?}")))
     }
 
-    fn persist_record(&self, mut record: ExecutionRecord) -> Result<ExecutionRecord, ExecutionError> {
+    fn persist_record(
+        &self,
+        mut record: ExecutionRecord,
+    ) -> Result<ExecutionRecord, ExecutionError> {
         self.redactor.redact(&mut record);
         let record = record
             .seal()

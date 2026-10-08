@@ -14,9 +14,7 @@ pub mod kernel;
 pub mod recovery;
 pub mod state;
 
-pub use action::{
-    Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult,
-};
+pub use action::{Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult};
 pub use error::{ExecutionError, FailureClass};
 pub use evidence::{
     CheckRecord, CommitDisposition, ConservativeRedactor, EvidenceRedactor, EvidenceStore,

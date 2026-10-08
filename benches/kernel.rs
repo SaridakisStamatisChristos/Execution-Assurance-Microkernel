@@ -67,11 +67,7 @@ impl Action for Increment {
         Ok(())
     }
 
-    fn verify_rollback(
-        &self,
-        ctx: &u64,
-        snapshot: &u64,
-    ) -> Result<Vec<CheckRecord>, Self::Error> {
+    fn verify_rollback(&self, ctx: &u64, snapshot: &u64) -> Result<Vec<CheckRecord>, Self::Error> {
         Ok(vec![if ctx == snapshot {
             CheckRecord::pass("rollback", "restored")
         } else {

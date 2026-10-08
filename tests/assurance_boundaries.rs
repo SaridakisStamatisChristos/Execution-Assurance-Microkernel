@@ -137,7 +137,9 @@ fn idempotency_store_failure_fails_before_the_effect() {
     );
     let mut world = World::default();
 
-    let error = kernel.execute(TestAction::default(), &mut world).unwrap_err();
+    let error = kernel
+        .execute(TestAction::default(), &mut world)
+        .unwrap_err();
 
     assert!(matches!(error, ExecutionError::Idempotency(_)));
     assert_eq!(world.commits, 0);

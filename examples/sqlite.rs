@@ -107,17 +107,19 @@ impl Action for UpdateAccount {
             [self.account_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(if balance == self.new_balance && version == self.expected_version + 1 {
-            ReconciliationResult::Committed(version)
-        } else if version == self.expected_version {
-            ReconciliationResult::NotCommitted
-        } else {
-            ReconciliationResult::Unresolved {
-                reason: format!(
+        Ok(
+            if balance == self.new_balance && version == self.expected_version + 1 {
+                ReconciliationResult::Committed(version)
+            } else if version == self.expected_version {
+                ReconciliationResult::NotCommitted
+            } else {
+                ReconciliationResult::Unresolved {
+                    reason: format!(
                     "row is at unexpected balance/version {balance}/{version}; cannot infer commit"
                 ),
-            }
-        })
+                }
+            },
+        )
     }
 
     fn verify(
@@ -167,11 +169,13 @@ impl Action for UpdateAccount {
             [self.account_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(vec![if balance == snapshot.balance && version == snapshot.version {
-            CheckRecord::pass("rollback_state", "row restored")
-        } else {
-            CheckRecord::fail("rollback_state", "row differs from snapshot")
-        }])
+        Ok(vec![
+            if balance == snapshot.balance && version == snapshot.version {
+                CheckRecord::pass("rollback_state", "row restored")
+            } else {
+                CheckRecord::fail("rollback_state", "row differs from snapshot")
+            },
+        ])
     }
 }
 

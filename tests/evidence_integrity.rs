@@ -100,7 +100,10 @@ fn raw_secrets_are_redacted_before_durable_evidence() {
         "inline-secret",
         "registered-secret",
     ] {
-        assert!(!text.contains(secret), "secret leaked into evidence: {secret}");
+        assert!(
+            !text.contains(secret),
+            "secret leaked into evidence: {secret}"
+        );
     }
     assert!(text.contains("[REDACTED]"));
     assert!(record.verify_hash().unwrap());
