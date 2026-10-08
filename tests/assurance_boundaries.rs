@@ -82,7 +82,9 @@ fn journal_failure_after_the_external_effect_never_becomes_success() {
     );
     let mut world = World::default();
 
-    let error = kernel.execute(TestAction::default(), &mut world).unwrap_err();
+    let error = kernel
+        .execute(TestAction::default(), &mut world)
+        .unwrap_err();
 
     assert!(matches!(error, ExecutionError::Journal(_)));
     assert_eq!(world.commits, 1);
@@ -101,7 +103,9 @@ fn evidence_persistence_failure_is_never_reported_as_success() {
     );
     let mut world = World::default();
 
-    let error = kernel.execute(TestAction::default(), &mut world).unwrap_err();
+    let error = kernel
+        .execute(TestAction::default(), &mut world)
+        .unwrap_err();
 
     assert!(matches!(error, ExecutionError::EvidencePersistence(_)));
     assert_eq!(world.commits, 1);
