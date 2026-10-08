@@ -1,5 +1,6 @@
 use execution_assurance_microkernel::{
-    Action, CheckRecord, CommitStatus, IdempotencyKey, Kernel, Predicate,
+    Action, CheckRecord, CommitStatus, EffectPermit, IdempotencyKey, Kernel, Predicate,
+    ReconciliationResult,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -52,6 +53,7 @@ impl Action for AtomicReplace {
     fn action_id(&self) -> String {
         format!("replace:{}", self.path.display())
     }
+
     fn action_type(&self) -> &'static str {
         "atomic_file_replace"
     }
@@ -78,10 +80,33 @@ impl Action for AtomicReplace {
         }
     }
 
-    fn commit(&self, _ctx: &mut ()) -> CommitStatus<Self::Output, Self::Error> {
+    fn commit(
+        &self,
+        _permit: &EffectPermit,
+        _ctx: &mut (),
+    ) -> CommitStatus<Self::Output, Self::Error> {
         match Self::replace(&self.path, &self.replacement) {
             Ok(()) => CommitStatus::Confirmed(Self::hash(&self.replacement)),
             Err(error) => CommitStatus::Failed(error),
+        }
+    }
+
+    fn reconcile(
+        &self,
+        _permit: &EffectPermit,
+        _ctx: &mut (),
+    ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
+        match fs::read(&self.path) {
+            Ok(bytes) if bytes == self.replacement => {
+                Ok(ReconciliationResult::Committed(Self::hash(&bytes)))
+            }
+            Ok(_) => Ok(ReconciliationResult::Unresolved {
+                reason: "target exists with content different from proposed replacement".to_string(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(ReconciliationResult::NotCommitted)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -95,7 +120,12 @@ impl Action for AtomicReplace {
         }])
     }
 
-    fn rollback(&self, _ctx: &mut (), snapshot: &Self::Snapshot) -> Result<(), Self::Error> {
+    fn rollback(
+        &self,
+        _permit: &EffectPermit,
+        _ctx: &mut (),
+        snapshot: &Self::Snapshot,
+    ) -> Result<(), Self::Error> {
         match snapshot {
             Some(bytes) => Self::replace(&self.path, bytes),
             None => match fs::remove_file(&self.path) {
