@@ -23,10 +23,12 @@ Prepared ---- known commit failure ---------------------------> Failed
 Committed ---- recovery may require readback ----> ReconciliationRequired
   |                                                   |
   |                                                   +--------> Committed
-  |  
-  +---- verification/invariant failure ----> RollbackPending ----> RolledBack
-  |                                                        \
-  |                                                         +--------> Failed
+  |
+  +---- non-compensable verification failure -----------------> Failed
+  |
+  +---- compensable verification/invariant failure --> RollbackPending --> RolledBack
+  |                                                                  \
+  |                                                                   +--> Failed
   v
 Verified
   |
@@ -51,9 +53,9 @@ The kernel cannot reach `Prepared` until validation, preconditions, snapshot cap
 - `Prepared -> Failed`: commit is known not to have succeeded.
 - `Prepared -> ReconciliationRequired`: effect outcome is unknown.
 - `Committed -> RollbackPending`: verification or post-commit invariant failed and the action is compensable.
+- `Committed -> Failed`: verification/invariant failed and the action explicitly has no safe compensation path.
 - `RollbackPending -> RolledBack`: compensation and rollback verification both succeed.
 - `RollbackPending -> Failed`: compensation or rollback verification fails.
-- non-compensable verification failure ends in `Failed` without pretending compensation occurred.
 
 ## Durable recovery interpretation
 
