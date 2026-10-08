@@ -1,0 +1,28 @@
+[package]
+name = "execution-assurance-microkernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "A minimal reference microkernel for verified side effects"
+repository = "https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel"
+keywords = ["reliability", "transactions", "verification", "rollback", "idempotency"]
+categories = ["development-tools", "data-structures"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+proptest = "1"
+criterion = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bench]]
+name = "kernel"
+harness = false
