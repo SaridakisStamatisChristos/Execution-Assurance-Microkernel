@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 use execution_assurance_microkernel::{
-    Action, CheckRecord, Clock, CommitStatus, EffectPermit, EvidenceStore, FaultInjector, IdGenerator,
-    IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Invariant,
-    InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate, ReconciliationResult,
-    SequenceIdGenerator,
+    Action, CheckRecord, Clock, CommitStatus, EffectPermit, EvidenceStore, FaultInjector,
+    IdGenerator, IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore,
+    InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate,
+    ReconciliationResult, SequenceIdGenerator,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -16,6 +16,7 @@ use thiserror::Error;
 pub struct World {
     pub value: i32,
     pub commits: usize,
+    pub rollbacks: usize,
 }
 
 #[derive(Debug, Error)]
@@ -62,6 +63,7 @@ pub struct TestAction {
     pub allowed: bool,
     pub verify_ok: bool,
     pub rollback_ok: bool,
+    pub partial_rollback: bool,
     pub commit_behavior: CommitBehavior,
 }
 
@@ -72,6 +74,7 @@ impl Default for TestAction {
             allowed: true,
             verify_ok: true,
             rollback_ok: true,
+            partial_rollback: false,
             commit_behavior: CommitBehavior::Confirmed,
         }
     }
@@ -139,8 +142,10 @@ impl Action for TestAction {
             CommitBehavior::UnknownUnresolved => ReconciliationResult::Unresolved {
                 reason: "still uncertain".to_string(),
             },
-            CommitBehavior::Confirmed => ReconciliationResult::Committed(ctx.value),
-            CommitBehavior::Failed => ReconciliationResult::NotCommitted,
+            CommitBehavior::Confirmed if ctx.commits > 0 => {
+                ReconciliationResult::Committed(ctx.value)
+            }
+            CommitBehavior::Confirmed | CommitBehavior::Failed => ReconciliationResult::NotCommitted,
         })
     }
 
@@ -158,6 +163,11 @@ impl Action for TestAction {
         ctx: &mut World,
         snapshot: &Self::Snapshot,
     ) -> Result<(), Self::Error> {
+        ctx.rollbacks += 1;
+        if self.partial_rollback {
+            ctx.value = snapshot.saturating_add(1);
+            return Err(TestError("rollback partially failed"));
+        }
         if !self.rollback_ok {
             return Err(TestError("rollback failed"));
         }
