@@ -42,6 +42,7 @@ impl ExecutionState {
                 | (Prepared, Committed)
                 | (Prepared, Failed)
                 | (Prepared, ReconciliationRequired)
+                | (Committed, ReconciliationRequired)
                 | (ReconciliationRequired, Committed)
                 | (ReconciliationRequired, Aborted)
                 | (Committed, Verified)
