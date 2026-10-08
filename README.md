@@ -143,7 +143,21 @@ Exactly three executable reference actions are kept intentionally:
 cargo bench --locked --bench kernel
 ```
 
-It benchmarks core verified success, core verification-failure → verified rollback, and a durable fsync-backed success path using `FileJournal`, `JsonlEvidenceStore`, and `FileIdempotencyStore`. CI compiles the benchmark target on every change; benchmark measurements are intentionally treated as environment-specific evidence rather than universal latency claims.
+It benchmarks core verified success, core verification-failure → verified rollback, and a durable fsync-backed success path using `FileJournal`, `JsonlEvidenceStore`, and `FileIdempotencyStore`. The harness emits explicit median/p95 samples in addition to Criterion's statistical report.
+
+### Reference benchmark evidence
+
+The reference run was executed on GitHub Actions `ubuntu-24.04`, Rust stable 1.99.0, on 2026-10-08. These are **environment-specific observations**, not universal latency guarantees.
+
+| Path | Samples | Median | p95 |
+|---|---:|---:|---:|
+| core verified success | 512 | 7.013 µs | 10.910 µs |
+| verification failure → verified rollback | 512 | 9.117 µs | 15.729 µs |
+| durable verified success with fsync | 64 | 1.990 ms | 2.522 ms |
+
+Criterion from the same run reported approximately `7.23–7.32 µs`, `9.45–9.65 µs`, and `2.29–2.42 ms` respectively. The complete validation and benchmark log is preserved by the linked [GitHub Actions run #75](https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel/actions/runs/37857640762).
+
+CI compiles the benchmark target on every change; benchmark execution is intentionally separate from the deterministic correctness gate because shared-runner latency is noisy.
 
 ## Scope
 
