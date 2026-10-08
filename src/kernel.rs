@@ -1,15 +1,20 @@
 use crate::{
-    action::{Action, CommitStatus, ReconciliationResult},
+    action::{Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult},
     error::{ExecutionError, FailureClass},
     evidence::{
-        CheckRecord, CommitDisposition, CommitRecord, EvidenceStore, ExecutionOutcome,
-        ExecutionRecord, ExecutionResult, FailureRecord, InMemoryEvidenceStore,
-        ReconciliationRecord, RollbackRecord, VerificationRecord,
+        CheckRecord, CommitDisposition, CommitRecord, ConservativeRedactor, EvidenceRedactor,
+        EvidenceStore, ExecutionOutcome, ExecutionRecord, ExecutionResult, FailureRecord,
+        InMemoryEvidenceStore, ReconciliationRecord, RecoveryRecord, RollbackRecord,
+        VerificationRecord,
     },
     fault::{FaultInjector, FaultPoint, NoFaultInjector},
-    idempotency::{ClaimOutcome, IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore},
+    idempotency::{
+        ClaimOutcome, ExecutionClaimOutcome, IdempotencyKey, IdempotencyStore,
+        InMemoryIdempotencyStore,
+    },
     invariant::InvariantPhase,
-    journal::{InMemoryJournal, Journal, JournalEntry},
+    journal::{InMemoryJournal, Journal, JournalEntry, RecoveryEnvelope},
+    recovery::{RecoveryManager, RecoveryPlan},
     state::{ExecutionState, ExecutionTrace},
 };
 use std::{
@@ -70,6 +75,33 @@ impl IdGenerator for SequenceIdGenerator {
     }
 }
 
+#[derive(Debug)]
+pub struct ExecutionRequest<A> {
+    pub execution_id: Option<String>,
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub action: A,
+}
+
+impl<A> ExecutionRequest<A> {
+    pub fn new(action: A) -> Self {
+        Self {
+            execution_id: None,
+            idempotency_key: None,
+            action,
+        }
+    }
+
+    pub fn with_execution_id(mut self, execution_id: impl Into<String>) -> Self {
+        self.execution_id = Some(execution_id.into());
+        self
+    }
+
+    pub fn with_idempotency_key(mut self, key: impl Into<IdempotencyKey>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct Kernel {
     journal: Arc<dyn Journal>,
@@ -78,6 +110,7 @@ pub struct Kernel {
     faults: Arc<dyn FaultInjector>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
+    redactor: Arc<dyn EvidenceRedactor>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -95,6 +128,7 @@ impl Default for Kernel {
             faults: Arc::new(NoFaultInjector),
             clock: Arc::new(SystemClock),
             ids: Arc::new(UuidIdGenerator),
+            redactor: Arc::new(ConservativeRedactor::default()),
         }
     }
 }
@@ -108,6 +142,26 @@ impl Kernel {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
+        Self::with_components_and_redactor(
+            journal,
+            evidence,
+            idempotency,
+            faults,
+            clock,
+            ids,
+            Arc::new(ConservativeRedactor::default()),
+        )
+    }
+
+    pub fn with_components_and_redactor(
+        journal: Arc<dyn Journal>,
+        evidence: Arc<dyn EvidenceStore>,
+        idempotency: Arc<dyn IdempotencyStore>,
+        faults: Arc<dyn FaultInjector>,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        redactor: Arc<dyn EvidenceRedactor>,
+    ) -> Self {
         Self {
             journal,
             evidence,
@@ -115,6 +169,7 @@ impl Kernel {
             faults,
             clock,
             ids,
+            redactor,
         }
     }
 
@@ -123,7 +178,7 @@ impl Kernel {
         action: A,
         ctx: &mut A::Context,
     ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
-        self.execute_with_key(action, ctx, None)
+        self.execute_request(ExecutionRequest::new(action), ctx)
     }
 
     pub fn execute_idempotent<A: Action>(
@@ -132,43 +187,180 @@ impl Kernel {
         ctx: &mut A::Context,
         key: IdempotencyKey,
     ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
-        self.execute_with_key(action, ctx, Some(key))
+        self.execute_request(ExecutionRequest::new(action).with_idempotency_key(key), ctx)
     }
 
-    fn execute_with_key<A: Action>(
+    pub fn execute_request<A: Action>(
+        &self,
+        request: ExecutionRequest<A>,
+        ctx: &mut A::Context,
+    ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
+        let execution_id = request.execution_id.unwrap_or_else(|| self.ids.next_id());
+        match self
+            .idempotency
+            .claim_execution_id(&execution_id)
+            .map_err(ExecutionError::Idempotency)?
+        {
+            ExecutionClaimOutcome::Claimed => {}
+            ExecutionClaimOutcome::Duplicate => {
+                return Err(ExecutionError::DuplicateExecutionId(execution_id));
+            }
+        }
+        self.execute_claimed(
+            request.action,
+            ctx,
+            execution_id,
+            request.idempotency_key,
+        )
+    }
+
+    pub fn recover<A: Action>(
+        &self,
+        execution_id: &str,
+        action: A,
+        ctx: &mut A::Context,
+    ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
+        if let Some(existing) = self
+            .evidence
+            .find(execution_id)
+            .map_err(ExecutionError::EvidencePersistence)?
+        {
+            if existing
+                .transitions
+                .last()
+                .is_some_and(|transition| transition.to.is_terminal())
+            {
+                return Err(ExecutionError::AlreadyFinalized(execution_id.to_string()));
+            }
+        }
+
+        let directive = RecoveryManager::directive(self.journal.as_ref(), execution_id)
+            .map_err(ExecutionError::Journal)?
+            .ok_or_else(|| ExecutionError::RecoveryUnavailable(execution_id.to_string()))?;
+        let envelope = directive.recovery.clone();
+        if let Some(envelope) = envelope.as_ref() {
+            if envelope.action_id != action.action_id() || envelope.action_type != action.action_type()
+            {
+                return Err(ExecutionError::RecoveryMismatch(format!(
+                    "journal has {}/{} but supplied action is {}/{}",
+                    envelope.action_type,
+                    envelope.action_id,
+                    action.action_type(),
+                    action.action_id()
+                )));
+            }
+        }
+
+        let mut trace = self.rebuild_trace(execution_id)?;
+        let started_at_ms = envelope
+            .as_ref()
+            .map_or_else(|| self.clock.now_ms(), |value| value.started_at_ms);
+        let idempotency_key = envelope
+            .as_ref()
+            .and_then(|value| value.idempotency_key.clone());
+        let mut record = self.new_record(
+            execution_id.to_string(),
+            &action,
+            idempotency_key,
+            started_at_ms,
+        );
+        record.recovery = Some(RecoveryRecord {
+            resumed: true,
+            from_state: directive.last_state,
+            detail: format!("recovery plan: {:?}", directive.plan),
+        });
+
+        match directive.plan {
+            RecoveryPlan::None => Err(ExecutionError::RecoveryUnavailable(execution_id.to_string())),
+            RecoveryPlan::AbortBeforeCommit => {
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::RecoveryFailed,
+                    message: "interrupted before durable preparation; no effect may be retried implicitly"
+                        .to_string(),
+                });
+                let terminal = if trace.state() == ExecutionState::Proposed {
+                    ExecutionState::Rejected
+                } else {
+                    ExecutionState::Aborted
+                };
+                self.finish_terminal(record, &mut trace, terminal, ExecutionOutcome::Aborted, None)
+            }
+            RecoveryPlan::ReconcileBeforeRetry => {
+                let envelope = envelope.ok_or_else(|| {
+                    ExecutionError::RecoveryData("prepared recovery envelope missing".to_string())
+                })?;
+                let snapshot = self.decode_snapshot::<A>(&envelope)?;
+                if trace.state() == ExecutionState::Prepared {
+                    self.transition(execution_id, &mut trace, ExecutionState::ReconciliationRequired)?;
+                }
+                record.commit = CommitRecord {
+                    disposition: CommitDisposition::Unknown,
+                    detail: "commit status reconstructed as uncertain".to_string(),
+                };
+                self.reconcile_recovery(&action, ctx, snapshot, record, trace)
+            }
+            RecoveryPlan::VerifyOrRollback => {
+                let envelope = envelope.ok_or_else(|| {
+                    ExecutionError::RecoveryData("prepared recovery envelope missing".to_string())
+                })?;
+                let snapshot = self.decode_snapshot::<A>(&envelope)?;
+                self.transition(
+                    execution_id,
+                    &mut trace,
+                    ExecutionState::ReconciliationRequired,
+                )?;
+                record.commit = CommitRecord {
+                    disposition: CommitDisposition::Confirmed,
+                    detail: "durable committed marker recovered".to_string(),
+                };
+                self.reconcile_recovery(&action, ctx, snapshot, record, trace)
+            }
+            RecoveryPlan::CompleteRollback => {
+                let envelope = envelope.ok_or_else(|| {
+                    ExecutionError::RecoveryData("rollback snapshot missing".to_string())
+                })?;
+                let snapshot = self.decode_snapshot::<A>(&envelope)?;
+                self.resume_rollback(&action, ctx, &snapshot, record, &mut trace)
+            }
+            RecoveryPlan::FinalizeVerified => {
+                record.commit = CommitRecord {
+                    disposition: CommitDisposition::Confirmed,
+                    detail: "durable verified marker implies established commit".to_string(),
+                };
+                record.verification = Some(VerificationRecord {
+                    passed: true,
+                    checks: vec![CheckRecord::pass(
+                        "durable_verified_marker",
+                        "postconditions were durably marked verified before interruption",
+                    )],
+                    detail: "verification recovered from journal".to_string(),
+                });
+                self.finish_terminal(
+                    record,
+                    &mut trace,
+                    ExecutionState::Finalized,
+                    ExecutionOutcome::Success,
+                    None,
+                )
+            }
+        }
+    }
+
+    fn execute_claimed<A: Action>(
         &self,
         action: A,
         ctx: &mut A::Context,
+        execution_id: String,
         key: Option<IdempotencyKey>,
     ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
-        let execution_id = self.ids.next_id();
         let started = self.clock.now_ms();
         let mut trace = ExecutionTrace::new();
-        let mut record = ExecutionRecord {
-            schema_version: 1,
-            execution_id: execution_id.clone(),
-            action_id: action.action_id(),
-            action_type: action.action_type().to_string(),
-            idempotency_key: key.as_ref().map(|key| key.0.clone()),
-            started_at_ms: started,
-            completed_at_ms: started,
-            transitions: Vec::new(),
-            validation: Vec::new(),
-            preconditions: Vec::new(),
-            invariants_before: Vec::new(),
-            invariants_after: Vec::new(),
-            invariants_after_rollback: Vec::new(),
-            commit: CommitRecord {
-                disposition: CommitDisposition::NotAttempted,
-                detail: String::new(),
-            },
-            reconciliation: None,
-            verification: None,
-            rollback: None,
-            failure: None,
-            outcome: ExecutionOutcome::Aborted,
-            record_hash: None,
-        };
+        let mut record = self.new_record(
+            execution_id.clone(),
+            &action,
+            key.as_ref().map(|value| value.0.clone()),
+            started,
+        );
 
         self.transition(&execution_id, &mut trace, ExecutionState::Proposed)?;
 
@@ -188,8 +380,13 @@ impl Kernel {
                             "idempotency key already claimed by {original_execution_id}"
                         ),
                     });
-                    self.transition(&execution_id, &mut trace, ExecutionState::Rejected)?;
-                    return self.finalize(record, &trace, ExecutionOutcome::Rejected, None);
+                    return self.finish_terminal(
+                        record,
+                        &mut trace,
+                        ExecutionState::Rejected,
+                        ExecutionOutcome::Rejected,
+                        None,
+                    );
                 }
             }
         }
@@ -206,8 +403,13 @@ impl Kernel {
                     class: FailureClass::ValidationFailed,
                     message: error.to_string(),
                 });
-                self.transition(&execution_id, &mut trace, ExecutionState::Rejected)?;
-                return self.finalize(record, &trace, ExecutionOutcome::Rejected, None);
+                return self.finish_terminal(
+                    record,
+                    &mut trace,
+                    ExecutionState::Rejected,
+                    ExecutionOutcome::Rejected,
+                    None,
+                );
             }
         }
 
@@ -221,8 +423,13 @@ impl Kernel {
                 class: FailureClass::PreconditionFailed,
                 message: format!("{}: {}", failed.name, failed.reason),
             });
-            self.transition(&execution_id, &mut trace, ExecutionState::Rejected)?;
-            return self.finalize(record, &trace, ExecutionOutcome::Rejected, None);
+            return self.finish_terminal(
+                record,
+                &mut trace,
+                ExecutionState::Rejected,
+                ExecutionOutcome::Rejected,
+                None,
+            );
         }
 
         self.transition(&execution_id, &mut trace, ExecutionState::Validated)?;
@@ -234,8 +441,13 @@ impl Kernel {
                     class: FailureClass::SnapshotFailed,
                     message: error.to_string(),
                 });
-                self.transition(&execution_id, &mut trace, ExecutionState::Aborted)?;
-                return self.finalize(record, &trace, ExecutionOutcome::Aborted, None);
+                return self.finish_terminal(
+                    record,
+                    &mut trace,
+                    ExecutionState::Aborted,
+                    ExecutionOutcome::Aborted,
+                    None,
+                );
             }
         };
         self.fault(FaultPoint::AfterSnapshot)?;
@@ -250,15 +462,55 @@ impl Kernel {
                 class: FailureClass::InvariantViolation,
                 message: format!("{}: {}", failed.name, failed.reason),
             });
-            self.transition(&execution_id, &mut trace, ExecutionState::Aborted)?;
-            return self.finalize(record, &trace, ExecutionOutcome::Aborted, None);
+            return self.finish_terminal(
+                record,
+                &mut trace,
+                ExecutionState::Aborted,
+                ExecutionOutcome::Aborted,
+                None,
+            );
         }
 
-        self.transition(&execution_id, &mut trace, ExecutionState::Prepared)?;
+        let snapshot_json = match serde_json::to_value(&snapshot) {
+            Ok(value) => value,
+            Err(error) => {
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::SnapshotFailed,
+                    message: format!("snapshot serialization failed: {error}"),
+                });
+                return self.finish_terminal(
+                    record,
+                    &mut trace,
+                    ExecutionState::Aborted,
+                    ExecutionOutcome::Aborted,
+                    None,
+                );
+            }
+        };
+        let recovery = RecoveryEnvelope {
+            action_id: action.action_id(),
+            action_type: action.action_type().to_string(),
+            idempotency_key: key.as_ref().map(|value| value.0.clone()),
+            started_at_ms: started,
+            compensation_policy: action.compensation_policy(),
+            snapshot: snapshot_json,
+        };
+        self.transition_with_recovery(
+            &execution_id,
+            &mut trace,
+            ExecutionState::Prepared,
+            recovery,
+        )?;
         self.fault(FaultPoint::BeforeCommit)?;
         self.fault(FaultPoint::DuringCommit)?;
 
-        let output = match action.commit(ctx) {
+        debug_assert!(record.validation.iter().all(|check| check.passed));
+        debug_assert!(record.preconditions.iter().all(|check| check.passed));
+        debug_assert!(record.invariants_before.iter().all(|check| check.passed));
+        debug_assert_eq!(trace.state(), ExecutionState::Prepared);
+
+        let permit = EffectPermit::new();
+        let output = match action.commit(&permit, ctx) {
             CommitStatus::Confirmed(output) => {
                 record.commit = CommitRecord {
                     disposition: CommitDisposition::Confirmed,
@@ -277,8 +529,13 @@ impl Kernel {
                     class: FailureClass::CommitFailed,
                     message: error.to_string(),
                 });
-                self.transition(&execution_id, &mut trace, ExecutionState::Failed)?;
-                return self.finalize(record, &trace, ExecutionOutcome::CommitFailed, None);
+                return self.finish_terminal(
+                    record,
+                    &mut trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::CommitFailed,
+                    None,
+                );
             }
             CommitStatus::Unknown { reason } => {
                 record.commit = CommitRecord {
@@ -287,14 +544,14 @@ impl Kernel {
                 };
                 record.failure = Some(FailureRecord {
                     class: FailureClass::CommitOutcomeUnknown,
-                    message: reason.clone(),
+                    message: reason,
                 });
                 self.transition(
                     &execution_id,
                     &mut trace,
                     ExecutionState::ReconciliationRequired,
                 )?;
-                match action.reconcile(ctx) {
+                match action.reconcile(&permit, ctx) {
                     Ok(ReconciliationResult::Committed(output)) => {
                         record.reconciliation = Some(ReconciliationRecord {
                             attempted: true,
@@ -317,10 +574,15 @@ impl Kernel {
                         });
                         record.commit = CommitRecord {
                             disposition: CommitDisposition::ReconciledNotCommitted,
-                            detail: "no effect observed".to_string(),
+                            detail: "no external effect observed".to_string(),
                         };
-                        self.transition(&execution_id, &mut trace, ExecutionState::Aborted)?;
-                        return self.finalize(record, &trace, ExecutionOutcome::Aborted, None);
+                        return self.finish_terminal(
+                            record,
+                            &mut trace,
+                            ExecutionState::Aborted,
+                            ExecutionOutcome::Aborted,
+                            None,
+                        );
                     }
                     Ok(ReconciliationResult::Unresolved { reason }) => {
                         record.reconciliation = Some(ReconciliationRecord {
@@ -332,7 +594,7 @@ impl Kernel {
                             class: FailureClass::ReconciliationFailed,
                             message: reason,
                         });
-                        return self.finalize(
+                        return self.persist_checkpoint(
                             record,
                             &trace,
                             ExecutionOutcome::ReconciliationRequired,
@@ -349,7 +611,7 @@ impl Kernel {
                             class: FailureClass::ReconciliationFailed,
                             message: error.to_string(),
                         });
-                        return self.finalize(
+                        return self.persist_checkpoint(
                             record,
                             &trace,
                             ExecutionOutcome::ReconciliationRequired,
@@ -360,6 +622,119 @@ impl Kernel {
             }
         };
 
+        self.after_commit(&action, ctx, &snapshot, output, record, &mut trace)
+    }
+
+    fn reconcile_recovery<A: Action>(
+        &self,
+        action: &A,
+        ctx: &mut A::Context,
+        snapshot: A::Snapshot,
+        mut record: ExecutionRecord,
+        mut trace: ExecutionTrace,
+    ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
+        let permit = EffectPermit::new();
+        match action.reconcile(&permit, ctx) {
+            Ok(ReconciliationResult::Committed(output)) => {
+                record.reconciliation = Some(ReconciliationRecord {
+                    attempted: true,
+                    resolved: true,
+                    detail: "recovery reconciliation confirmed commit".to_string(),
+                });
+                record.commit = CommitRecord {
+                    disposition: CommitDisposition::ReconciledCommitted,
+                    detail: "commit re-established by recovery reconciliation".to_string(),
+                };
+                record.failure = None;
+                self.transition(
+                    &record.execution_id,
+                    &mut trace,
+                    ExecutionState::Committed,
+                )?;
+                self.after_commit(action, ctx, &snapshot, output, record, &mut trace)
+            }
+            Ok(ReconciliationResult::NotCommitted) => {
+                record.reconciliation = Some(ReconciliationRecord {
+                    attempted: true,
+                    resolved: true,
+                    detail: "recovery established no commit".to_string(),
+                });
+                record.commit = CommitRecord {
+                    disposition: CommitDisposition::ReconciledNotCommitted,
+                    detail: "no effect observed during recovery".to_string(),
+                };
+                if trace.state() == ExecutionState::ReconciliationRequired
+                    && record
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.from_state == ExecutionState::Committed)
+                {
+                    record.failure = Some(FailureRecord {
+                        class: FailureClass::RecoveryFailed,
+                        message: "durable committed marker conflicts with reconciliation"
+                            .to_string(),
+                    });
+                    return self.persist_checkpoint(
+                        record,
+                        &trace,
+                        ExecutionOutcome::ReconciliationRequired,
+                        None,
+                    );
+                }
+                self.finish_terminal(
+                    record,
+                    &mut trace,
+                    ExecutionState::Aborted,
+                    ExecutionOutcome::Aborted,
+                    None,
+                )
+            }
+            Ok(ReconciliationResult::Unresolved { reason }) => {
+                record.reconciliation = Some(ReconciliationRecord {
+                    attempted: true,
+                    resolved: false,
+                    detail: reason.clone(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::ReconciliationFailed,
+                    message: reason,
+                });
+                self.persist_checkpoint(
+                    record,
+                    &trace,
+                    ExecutionOutcome::ReconciliationRequired,
+                    None,
+                )
+            }
+            Err(error) => {
+                record.reconciliation = Some(ReconciliationRecord {
+                    attempted: true,
+                    resolved: false,
+                    detail: error.to_string(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::ReconciliationFailed,
+                    message: error.to_string(),
+                });
+                self.persist_checkpoint(
+                    record,
+                    &trace,
+                    ExecutionOutcome::ReconciliationRequired,
+                    None,
+                )
+            }
+        }
+    }
+
+    fn after_commit<A: Action>(
+        &self,
+        action: &A,
+        ctx: &mut A::Context,
+        snapshot: &A::Snapshot,
+        output: A::Output,
+        mut record: ExecutionRecord,
+        trace: &mut ExecutionTrace,
+    ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
         record.invariants_after = action
             .invariants()
             .into_iter()
@@ -370,7 +745,7 @@ impl Kernel {
                 class: FailureClass::InvariantViolation,
                 message: format!("{}: {}", failed.name, failed.reason),
             });
-            return self.rollback_after_failure(&action, ctx, &snapshot, record, &mut trace);
+            return self.rollback_after_failure(action, ctx, snapshot, record, trace);
         }
 
         self.fault(FaultPoint::BeforeVerify)?;
@@ -396,7 +771,7 @@ impl Kernel {
                     class: FailureClass::VerificationFailed,
                     message: detail,
                 });
-                return self.rollback_after_failure(&action, ctx, &snapshot, record, &mut trace);
+                return self.rollback_after_failure(action, ctx, snapshot, record, trace);
             }
             Err(error) => {
                 record.verification = Some(VerificationRecord {
@@ -408,13 +783,23 @@ impl Kernel {
                     class: FailureClass::VerificationFailed,
                     message: error.to_string(),
                 });
-                return self.rollback_after_failure(&action, ctx, &snapshot, record, &mut trace);
+                return self.rollback_after_failure(action, ctx, snapshot, record, trace);
             }
         }
 
-        self.transition(&execution_id, &mut trace, ExecutionState::Verified)?;
-        self.transition(&execution_id, &mut trace, ExecutionState::Finalized)?;
-        self.finalize(record, &trace, ExecutionOutcome::Success, Some(output))
+        self.transition(&record.execution_id, trace, ExecutionState::Verified)?;
+        debug_assert!(record.verification.as_ref().is_some_and(|value| value.passed));
+        debug_assert!(matches!(
+            record.commit.disposition,
+            CommitDisposition::Confirmed | CommitDisposition::ReconciledCommitted
+        ));
+        self.finish_terminal(
+            record,
+            trace,
+            ExecutionState::Finalized,
+            ExecutionOutcome::Success,
+            Some(output),
+        )
     }
 
     fn rollback_after_failure<A: Action>(
@@ -425,11 +810,35 @@ impl Kernel {
         mut record: ExecutionRecord,
         trace: &mut ExecutionTrace,
     ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
-        let execution_id = record.execution_id.clone();
-        self.transition(&execution_id, trace, ExecutionState::RollbackPending)?;
-        self.fault(FaultPoint::DuringRollback)?;
+        if action.compensation_policy() == CompensationPolicy::NonCompensable {
+            record.rollback = Some(RollbackRecord {
+                attempted: false,
+                succeeded: false,
+                verified: false,
+                checks: Vec::new(),
+                detail: "action declares no compensating rollback".to_string(),
+            });
+            record.failure = Some(FailureRecord {
+                class: FailureClass::CompensationUnavailable,
+                message: "verification failed and action is non-compensable".to_string(),
+            });
+            return self.finish_terminal(
+                record,
+                trace,
+                ExecutionState::Failed,
+                ExecutionOutcome::RollbackFailed,
+                None,
+            );
+        }
 
-        if let Err(error) = action.rollback(ctx, snapshot) {
+        self.transition(
+            &record.execution_id,
+            trace,
+            ExecutionState::RollbackPending,
+        )?;
+        self.fault(FaultPoint::DuringRollback)?;
+        let permit = EffectPermit::new();
+        if let Err(error) = action.rollback(&permit, ctx, snapshot) {
             record.rollback = Some(RollbackRecord {
                 attempted: true,
                 succeeded: false,
@@ -441,11 +850,108 @@ impl Kernel {
                 class: FailureClass::RollbackFailed,
                 message: error.to_string(),
             });
-            self.transition(&execution_id, trace, ExecutionState::Failed)?;
-            return self.finalize(record, trace, ExecutionOutcome::RollbackFailed, None);
+            return self.finish_terminal(
+                record,
+                trace,
+                ExecutionState::Failed,
+                ExecutionOutcome::RollbackFailed,
+                None,
+            );
+        }
+        self.fault(FaultPoint::AfterRollback)?;
+        self.verify_rollback(action, ctx, snapshot, record, trace, true)
+    }
+
+    fn resume_rollback<A: Action>(
+        &self,
+        action: &A,
+        ctx: &mut A::Context,
+        snapshot: &A::Snapshot,
+        mut record: ExecutionRecord,
+        trace: &mut ExecutionTrace,
+    ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
+        if action.compensation_policy() == CompensationPolicy::NonCompensable {
+            record.failure = Some(FailureRecord {
+                class: FailureClass::CompensationUnavailable,
+                message: "cannot resume rollback for non-compensable action".to_string(),
+            });
+            record.rollback = Some(RollbackRecord {
+                attempted: false,
+                succeeded: false,
+                verified: false,
+                checks: Vec::new(),
+                detail: "compensation unavailable".to_string(),
+            });
+            return self.finish_terminal(
+                record,
+                trace,
+                ExecutionState::Failed,
+                ExecutionOutcome::RollbackFailed,
+                None,
+            );
         }
 
-        self.fault(FaultPoint::AfterRollback)?;
+        let precheck = action.verify_rollback(ctx, snapshot);
+        let invariants: Vec<_> = action
+            .invariants()
+            .into_iter()
+            .map(|invariant| invariant.check(InvariantPhase::AfterRollback, ctx))
+            .collect();
+        if let Ok(checks) = precheck {
+            if checks.iter().all(|check| check.passed)
+                && invariants.iter().all(|check| check.passed)
+            {
+                record.invariants_after_rollback = invariants;
+                record.rollback = Some(RollbackRecord {
+                    attempted: false,
+                    succeeded: true,
+                    verified: true,
+                    checks,
+                    detail: "rollback was already complete when recovery resumed".to_string(),
+                });
+                return self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::RolledBack,
+                    ExecutionOutcome::RolledBack,
+                    None,
+                );
+            }
+        }
+
+        let permit = EffectPermit::new();
+        if let Err(error) = action.rollback(&permit, ctx, snapshot) {
+            record.rollback = Some(RollbackRecord {
+                attempted: true,
+                succeeded: false,
+                verified: false,
+                checks: Vec::new(),
+                detail: error.to_string(),
+            });
+            record.failure = Some(FailureRecord {
+                class: FailureClass::RollbackFailed,
+                message: error.to_string(),
+            });
+            return self.finish_terminal(
+                record,
+                trace,
+                ExecutionState::Failed,
+                ExecutionOutcome::RollbackFailed,
+                None,
+            );
+        }
+        self.verify_rollback(action, ctx, snapshot, record, trace, true)
+    }
+
+    fn verify_rollback<A: Action>(
+        &self,
+        action: &A,
+        ctx: &A::Context,
+        snapshot: &A::Snapshot,
+        mut record: ExecutionRecord,
+        trace: &mut ExecutionTrace,
+        attempted: bool,
+    ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
         let verification = action.verify_rollback(ctx, snapshot);
         record.invariants_after_rollback = action
             .invariants()
@@ -460,14 +966,19 @@ impl Kernel {
         match verification {
             Ok(checks) if checks.iter().all(|check| check.passed) && invariants_ok => {
                 record.rollback = Some(RollbackRecord {
-                    attempted: true,
+                    attempted,
                     succeeded: true,
                     verified: true,
                     checks,
                     detail: "rollback verified".to_string(),
                 });
-                self.transition(&execution_id, trace, ExecutionState::RolledBack)?;
-                self.finalize(record, trace, ExecutionOutcome::RolledBack, None)
+                self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::RolledBack,
+                    ExecutionOutcome::RolledBack,
+                    None,
+                )
             }
             Ok(checks) => {
                 let detail = if let Some(failed) = checks.iter().find(|check| !check.passed) {
@@ -488,7 +999,7 @@ impl Kernel {
                     "rollback verification failed".to_string()
                 };
                 record.rollback = Some(RollbackRecord {
-                    attempted: true,
+                    attempted,
                     succeeded: true,
                     verified: false,
                     checks,
@@ -498,12 +1009,17 @@ impl Kernel {
                     class: FailureClass::RollbackFailed,
                     message: detail,
                 });
-                self.transition(&execution_id, trace, ExecutionState::Failed)?;
-                self.finalize(record, trace, ExecutionOutcome::RollbackFailed, None)
+                self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::RollbackFailed,
+                    None,
+                )
             }
             Err(error) => {
                 record.rollback = Some(RollbackRecord {
-                    attempted: true,
+                    attempted,
                     succeeded: true,
                     verified: false,
                     checks: Vec::new(),
@@ -513,9 +1029,71 @@ impl Kernel {
                     class: FailureClass::RollbackFailed,
                     message: error.to_string(),
                 });
-                self.transition(&execution_id, trace, ExecutionState::Failed)?;
-                self.finalize(record, trace, ExecutionOutcome::RollbackFailed, None)
+                self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::RollbackFailed,
+                    None,
+                )
             }
+        }
+    }
+
+    fn decode_snapshot<A: Action>(
+        &self,
+        envelope: &RecoveryEnvelope,
+    ) -> Result<A::Snapshot, ExecutionError> {
+        serde_json::from_value(envelope.snapshot.clone())
+            .map_err(|error| ExecutionError::RecoveryData(error.to_string()))
+    }
+
+    fn rebuild_trace(&self, execution_id: &str) -> Result<ExecutionTrace, ExecutionError> {
+        let mut trace = ExecutionTrace::new();
+        for entry in self
+            .journal
+            .entries()
+            .map_err(ExecutionError::Journal)?
+            .into_iter()
+            .filter(|entry| entry.execution_id == execution_id)
+        {
+            trace.transition(entry.state, entry.at_ms)?;
+        }
+        Ok(trace)
+    }
+
+    fn new_record<A: Action>(
+        &self,
+        execution_id: String,
+        action: &A,
+        idempotency_key: Option<String>,
+        started_at_ms: u64,
+    ) -> ExecutionRecord {
+        ExecutionRecord {
+            schema_version: 2,
+            execution_id,
+            action_id: action.action_id(),
+            action_type: action.action_type().to_string(),
+            idempotency_key,
+            started_at_ms,
+            completed_at_ms: started_at_ms,
+            transitions: Vec::new(),
+            validation: Vec::new(),
+            preconditions: Vec::new(),
+            invariants_before: Vec::new(),
+            invariants_after: Vec::new(),
+            invariants_after_rollback: Vec::new(),
+            commit: CommitRecord {
+                disposition: CommitDisposition::NotAttempted,
+                detail: String::new(),
+            },
+            reconciliation: None,
+            verification: None,
+            rollback: None,
+            recovery: None,
+            failure: None,
+            outcome: ExecutionOutcome::Aborted,
+            record_hash: None,
         }
     }
 
@@ -528,10 +1106,25 @@ impl Kernel {
         let at_ms = self.clock.now_ms();
         trace.transition(next, at_ms)?;
         self.journal
+            .append(JournalEntry::state(execution_id, next, at_ms))
+            .map_err(ExecutionError::Journal)
+    }
+
+    fn transition_with_recovery(
+        &self,
+        execution_id: &str,
+        trace: &mut ExecutionTrace,
+        next: ExecutionState,
+        recovery: RecoveryEnvelope,
+    ) -> Result<(), ExecutionError> {
+        let at_ms = self.clock.now_ms();
+        trace.transition(next, at_ms)?;
+        self.journal
             .append(JournalEntry {
                 execution_id: execution_id.to_string(),
                 state: next,
                 at_ms,
+                recovery: Some(recovery),
             })
             .map_err(ExecutionError::Journal)
     }
@@ -542,7 +1135,18 @@ impl Kernel {
             .map_err(|_| ExecutionError::InjectedFault(format!("{point:?}")))
     }
 
-    fn finalize<T: Clone>(
+    fn persist_record(&self, mut record: ExecutionRecord) -> Result<ExecutionRecord, ExecutionError> {
+        self.redactor.redact(&mut record);
+        let record = record
+            .seal()
+            .map_err(|error| ExecutionError::EvidencePersistence(error.to_string()))?;
+        self.evidence
+            .persist(&record)
+            .map_err(ExecutionError::EvidencePersistence)?;
+        Ok(record)
+    }
+
+    fn persist_checkpoint<T: Clone>(
         &self,
         mut record: ExecutionRecord,
         trace: &ExecutionTrace,
@@ -552,12 +1156,36 @@ impl Kernel {
         record.completed_at_ms = self.clock.now_ms();
         record.transitions = trace.transitions().to_vec();
         record.outcome = outcome;
-        let record = record
-            .seal()
-            .map_err(|error| ExecutionError::EvidencePersistence(error.to_string()))?;
-        self.evidence
-            .persist(&record)
-            .map_err(ExecutionError::EvidencePersistence)?;
+        let record = self.persist_record(record)?;
+        Ok(ExecutionResult {
+            execution_id: record.execution_id.clone(),
+            outcome,
+            output,
+            record,
+        })
+    }
+
+    fn finish_terminal<T: Clone>(
+        &self,
+        mut record: ExecutionRecord,
+        trace: &mut ExecutionTrace,
+        terminal: ExecutionState,
+        outcome: ExecutionOutcome,
+        output: Option<T>,
+    ) -> Result<ExecutionResult<T>, ExecutionError> {
+        debug_assert!(terminal.is_terminal());
+        let at_ms = self.clock.now_ms();
+        trace.transition(terminal, at_ms)?;
+        record.completed_at_ms = at_ms;
+        record.transitions = trace.transitions().to_vec();
+        record.outcome = outcome;
+        let record = self.persist_record(record)?;
+
+        // K5 ordering: terminal state becomes durable only after its evidence exists.
+        self.journal
+            .append(JournalEntry::state(&record.execution_id, terminal, at_ms))
+            .map_err(ExecutionError::Journal)?;
+
         Ok(ExecutionResult {
             execution_id: record.execution_id.clone(),
             outcome,
