@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   quality:
@@ -31,13 +31,23 @@ jobs:
         run: cargo bench --no-run
 
   msrv:
-    name: msrv / 1.85
+    name: msrv / 1.89
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-1.85
+          key: msrv-1.89
       - name: Check library at declared MSRV
         run: cargo check --lib
+      - name: Commit resolved dependency lockfile
+        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+        run: |
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: lock dependency graph"
+            git push
+          fi
