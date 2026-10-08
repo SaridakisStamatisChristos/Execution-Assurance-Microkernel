@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use execution_assurance_microkernel::{
     Action, CheckRecord, Clock, CommitStatus, EvidenceStore, FaultInjector, IdGenerator,
     IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Invariant,
