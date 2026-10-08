@@ -1,10 +1,10 @@
-use crate::{error::FailureClass, state::StateTransition};
+use crate::{error::FailureClass, state::StateTransition, ExecutionState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
-    path::Path,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 
@@ -74,6 +74,13 @@ pub struct RollbackRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryRecord {
+    pub resumed: bool,
+    pub from_state: ExecutionState,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureRecord {
     pub class: FailureClass,
     pub message: String,
@@ -110,6 +117,7 @@ pub struct ExecutionRecord {
     pub reconciliation: Option<ReconciliationRecord>,
     pub verification: Option<VerificationRecord>,
     pub rollback: Option<RollbackRecord>,
+    pub recovery: Option<RecoveryRecord>,
     pub failure: Option<FailureRecord>,
     pub outcome: ExecutionOutcome,
     pub record_hash: Option<String>,
@@ -122,7 +130,6 @@ impl ExecutionRecord {
         Ok(self)
     }
 
-    /// Recompute and compare the SHA-256 seal without mutating the record.
     pub fn verify_hash(&self) -> Result<bool, serde_json::Error> {
         let Some(expected) = self.record_hash.as_ref() else {
             return Ok(false);
@@ -150,6 +157,7 @@ pub struct ExecutionResult<T> {
 
 pub trait EvidenceStore: Send + Sync {
     fn persist(&self, record: &ExecutionRecord) -> Result<(), String>;
+    fn find(&self, execution_id: &str) -> Result<Option<ExecutionRecord>, String>;
 }
 
 #[derive(Debug, Default)]
@@ -174,17 +182,35 @@ impl EvidenceStore for InMemoryEvidenceStore {
             .push(record.clone());
         Ok(())
     }
+
+    fn find(&self, execution_id: &str) -> Result<Option<ExecutionRecord>, String> {
+        Ok(self
+            .records
+            .lock()
+            .map_err(|_| "evidence lock poisoned".to_string())?
+            .iter()
+            .rev()
+            .find(|record| record.execution_id == execution_id)
+            .cloned())
+    }
 }
 
 #[derive(Debug)]
 pub struct JsonlEvidenceStore {
+    path: PathBuf,
     file: Mutex<File>,
 }
 
 impl JsonlEvidenceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
         Ok(Self {
+            path,
             file: Mutex::new(file),
         })
     }
@@ -201,5 +227,110 @@ impl EvidenceStore for JsonlEvidenceStore {
         file.write_all(b"\n").map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())?;
         file.sync_data().map_err(|error| error.to_string())
+    }
+
+    fn find(&self, execution_id: &str) -> Result<Option<ExecutionRecord>, String> {
+        let file = File::open(&self.path).map_err(|error| error.to_string())?;
+        let mut found = None;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|error| error.to_string())?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: ExecutionRecord =
+                serde_json::from_str(&line).map_err(|error| error.to_string())?;
+            if record.execution_id == execution_id {
+                found = Some(record);
+            }
+        }
+        Ok(found)
+    }
+}
+
+pub trait EvidenceRedactor: Send + Sync {
+    fn redact(&self, record: &mut ExecutionRecord);
+}
+
+#[derive(Debug, Default)]
+pub struct ConservativeRedactor {
+    secrets: Vec<String>,
+}
+
+impl ConservativeRedactor {
+    pub fn with_secrets<I, S>(secrets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            secrets: secrets.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn redact_text(&self, value: &str) -> String {
+        let mut redacted = value.to_string();
+        for secret in &self.secrets {
+            if !secret.is_empty() {
+                redacted = redacted.replace(secret, "[REDACTED]");
+            }
+        }
+        for marker in ["password=", "token=", "secret=", "api_key=", "authorization="] {
+            loop {
+                let lower = redacted.to_ascii_lowercase();
+                let Some(start) = lower.find(marker) else {
+                    break;
+                };
+                let value_start = start + marker.len();
+                let end = redacted[value_start..]
+                    .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '&'))
+                    .map_or(redacted.len(), |offset| value_start + offset);
+                if value_start == end {
+                    break;
+                }
+                redacted.replace_range(value_start..end, "[REDACTED]");
+            }
+        }
+        redacted
+    }
+
+    fn redact_checks(&self, checks: &mut [CheckRecord]) {
+        for check in checks {
+            check.name = self.redact_text(&check.name);
+            check.reason = self.redact_text(&check.reason);
+        }
+    }
+}
+
+impl EvidenceRedactor for ConservativeRedactor {
+    fn redact(&self, record: &mut ExecutionRecord) {
+        record.action_id = self.redact_text(&record.action_id);
+        record.action_type = self.redact_text(&record.action_type);
+        record.idempotency_key = record
+            .idempotency_key
+            .take()
+            .map(|value| self.redact_text(&value));
+        self.redact_checks(&mut record.validation);
+        self.redact_checks(&mut record.preconditions);
+        self.redact_checks(&mut record.invariants_before);
+        self.redact_checks(&mut record.invariants_after);
+        self.redact_checks(&mut record.invariants_after_rollback);
+        record.commit.detail = self.redact_text(&record.commit.detail);
+        if let Some(reconciliation) = record.reconciliation.as_mut() {
+            reconciliation.detail = self.redact_text(&reconciliation.detail);
+        }
+        if let Some(verification) = record.verification.as_mut() {
+            verification.detail = self.redact_text(&verification.detail);
+            self.redact_checks(&mut verification.checks);
+        }
+        if let Some(rollback) = record.rollback.as_mut() {
+            rollback.detail = self.redact_text(&rollback.detail);
+            self.redact_checks(&mut rollback.checks);
+        }
+        if let Some(recovery) = record.recovery.as_mut() {
+            recovery.detail = self.redact_text(&recovery.detail);
+        }
+        if let Some(failure) = record.failure.as_mut() {
+            failure.message = self.redact_text(&failure.message);
+        }
     }
 }
