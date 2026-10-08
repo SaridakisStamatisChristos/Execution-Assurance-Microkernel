@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "A minimal reference microkernel for verified side effects"
+readme = "README.md"
+license = "Apache-2.0"
 repository = "https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel"
+homepage = "https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel"
 keywords = ["reliability", "transactions", "verification", "rollback", "idempotency"]
 categories = ["development-tools", "data-structures"]
 
