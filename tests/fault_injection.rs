@@ -21,8 +21,14 @@ fn every_fault_point_is_deterministically_reproducible() {
             Arc::new(ScriptedFaultInjector::with_fault(point)),
         );
         let mut world = World::default();
-        let action = if matches!(point, FaultPoint::DuringRollback | FaultPoint::AfterRollback) {
-            TestAction { verify_ok: false, ..TestAction::default() }
+        let action = if matches!(
+            point,
+            FaultPoint::DuringRollback | FaultPoint::AfterRollback
+        ) {
+            TestAction {
+                verify_ok: false,
+                ..TestAction::default()
+            }
         } else {
             TestAction::default()
         };

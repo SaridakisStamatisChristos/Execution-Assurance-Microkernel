@@ -35,13 +35,28 @@ pub trait Action {
     fn snapshot(&self, ctx: &Self::Context) -> Result<Self::Snapshot, Self::Error>;
     fn commit(&self, ctx: &mut Self::Context) -> CommitStatus<Self::Output, Self::Error>;
 
-    fn verify(&self, ctx: &Self::Context, output: &Self::Output) -> Result<Vec<crate::CheckRecord>, Self::Error>;
+    fn verify(
+        &self,
+        ctx: &Self::Context,
+        output: &Self::Output,
+    ) -> Result<Vec<crate::CheckRecord>, Self::Error>;
 
-    fn rollback(&self, ctx: &mut Self::Context, snapshot: &Self::Snapshot) -> Result<(), Self::Error>;
+    fn rollback(
+        &self,
+        ctx: &mut Self::Context,
+        snapshot: &Self::Snapshot,
+    ) -> Result<(), Self::Error>;
 
-    fn verify_rollback(&self, ctx: &Self::Context, snapshot: &Self::Snapshot) -> Result<Vec<crate::CheckRecord>, Self::Error>;
+    fn verify_rollback(
+        &self,
+        ctx: &Self::Context,
+        snapshot: &Self::Snapshot,
+    ) -> Result<Vec<crate::CheckRecord>, Self::Error>;
 
-    fn reconcile(&self, _ctx: &mut Self::Context) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
+    fn reconcile(
+        &self,
+        _ctx: &mut Self::Context,
+    ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(ReconciliationResult::Unresolved {
             reason: "no reconciliation strategy supplied".to_string(),
         })

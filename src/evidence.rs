@@ -17,11 +17,19 @@ pub struct CheckRecord {
 
 impl CheckRecord {
     pub fn pass(name: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self { name: name.into(), passed: true, reason: reason.into() }
+        Self {
+            name: name.into(),
+            passed: true,
+            reason: reason.into(),
+        }
     }
 
     pub fn fail(name: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self { name: name.into(), passed: false, reason: reason.into() }
+        Self {
+            name: name.into(),
+            passed: false,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -137,13 +145,19 @@ pub struct InMemoryEvidenceStore {
 
 impl InMemoryEvidenceStore {
     pub fn records(&self) -> Result<Vec<ExecutionRecord>, String> {
-        self.records.lock().map(|records| records.clone()).map_err(|_| "evidence lock poisoned".to_string())
+        self.records
+            .lock()
+            .map(|records| records.clone())
+            .map_err(|_| "evidence lock poisoned".to_string())
     }
 }
 
 impl EvidenceStore for InMemoryEvidenceStore {
     fn persist(&self, record: &ExecutionRecord) -> Result<(), String> {
-        self.records.lock().map_err(|_| "evidence lock poisoned".to_string())?.push(record.clone());
+        self.records
+            .lock()
+            .map_err(|_| "evidence lock poisoned".to_string())?
+            .push(record.clone());
         Ok(())
     }
 }
@@ -156,14 +170,19 @@ pub struct JsonlEvidenceStore {
 impl JsonlEvidenceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Mutex::new(file) })
+        Ok(Self {
+            file: Mutex::new(file),
+        })
     }
 }
 
 impl EvidenceStore for JsonlEvidenceStore {
     fn persist(&self, record: &ExecutionRecord) -> Result<(), String> {
         let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
-        let mut file = self.file.lock().map_err(|_| "evidence file lock poisoned".to_string())?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| "evidence file lock poisoned".to_string())?;
         file.write_all(&bytes).map_err(|error| error.to_string())?;
         file.write_all(b"\n").map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())?;

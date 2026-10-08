@@ -17,8 +17,9 @@ pub mod state;
 pub use action::{Action, CommitStatus, ReconciliationResult};
 pub use error::{ExecutionError, FailureClass};
 pub use evidence::{
-    CheckRecord, CommitDisposition, EvidenceStore, ExecutionOutcome, ExecutionRecord, ExecutionResult,
-    InMemoryEvidenceStore, JsonlEvidenceStore, ReconciliationRecord, RollbackRecord, VerificationRecord,
+    CheckRecord, CommitDisposition, EvidenceStore, ExecutionOutcome, ExecutionRecord,
+    ExecutionResult, InMemoryEvidenceStore, JsonlEvidenceStore, ReconciliationRecord,
+    RollbackRecord, VerificationRecord,
 };
 pub use fault::{FaultInjector, FaultPoint, NoFaultInjector, ScriptedFaultInjector};
 pub use idempotency::{IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore};

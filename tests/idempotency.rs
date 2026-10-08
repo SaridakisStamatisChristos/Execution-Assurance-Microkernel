@@ -15,8 +15,20 @@ fn duplicate_key_never_commits_twice() {
     let kernel = kernel_with(journal, evidence, ids, Arc::new(NoFaultInjector));
     let mut world = World::default();
 
-    let first = kernel.execute_idempotent(TestAction::default(), &mut world, IdempotencyKey::from("same")).unwrap();
-    let second = kernel.execute_idempotent(TestAction::default(), &mut world, IdempotencyKey::from("same")).unwrap();
+    let first = kernel
+        .execute_idempotent(
+            TestAction::default(),
+            &mut world,
+            IdempotencyKey::from("same"),
+        )
+        .unwrap();
+    let second = kernel
+        .execute_idempotent(
+            TestAction::default(),
+            &mut world,
+            IdempotencyKey::from("same"),
+        )
+        .unwrap();
 
     assert_eq!(first.outcome, ExecutionOutcome::Success);
     assert_eq!(second.outcome, ExecutionOutcome::Rejected);

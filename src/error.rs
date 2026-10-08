@@ -23,7 +23,10 @@ pub enum FailureClass {
 #[derive(Debug, Error)]
 pub enum ExecutionError {
     #[error("invalid state transition: {from:?} -> {to:?}")]
-    InvalidTransition { from: ExecutionState, to: ExecutionState },
+    InvalidTransition {
+        from: ExecutionState,
+        to: ExecutionState,
+    },
     #[error("journal failure: {0}")]
     Journal(String),
     #[error("evidence persistence failure: {0}")]

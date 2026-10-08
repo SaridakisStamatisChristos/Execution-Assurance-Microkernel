@@ -15,8 +15,13 @@ impl Predicate<Connection> for RowVersion {
             |row| row.get(0),
         );
         match result {
-            Ok(version) if version == self.expected_version => CheckRecord::pass("row_version", format!("version={version}")),
-            Ok(version) => CheckRecord::fail("row_version", format!("expected {}, got {version}", self.expected_version)),
+            Ok(version) if version == self.expected_version => {
+                CheckRecord::pass("row_version", format!("version={version}"))
+            }
+            Ok(version) => CheckRecord::fail(
+                "row_version",
+                format!("expected {}, got {version}", self.expected_version),
+            ),
             Err(error) => CheckRecord::fail("row_version", error.to_string()),
         }
     }
@@ -41,19 +46,33 @@ impl Action for UpdateAccount {
     type Error = rusqlite::Error;
     type Snapshot = AccountSnapshot;
 
-    fn action_id(&self) -> String { format!("account:{}", self.account_id) }
-    fn action_type(&self) -> &'static str { "sqlite_account_update" }
-    fn validate(&self, _ctx: &Connection) -> Result<(), Self::Error> { Ok(()) }
+    fn action_id(&self) -> String {
+        format!("account:{}", self.account_id)
+    }
+    fn action_type(&self) -> &'static str {
+        "sqlite_account_update"
+    }
+    fn validate(&self, _ctx: &Connection) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn preconditions(&self) -> Vec<Box<dyn Predicate<Connection> + '_>> {
-        vec![Box::new(RowVersion { account_id: self.account_id, expected_version: self.expected_version })]
+        vec![Box::new(RowVersion {
+            account_id: self.account_id,
+            expected_version: self.expected_version,
+        })]
     }
 
     fn snapshot(&self, conn: &Connection) -> Result<Self::Snapshot, Self::Error> {
         conn.query_row(
             "SELECT balance, version FROM account WHERE id = ?1",
             [self.account_id],
-            |row| Ok(AccountSnapshot { balance: row.get(0)?, version: row.get(1)? }),
+            |row| {
+                Ok(AccountSnapshot {
+                    balance: row.get(0)?,
+                    version: row.get(1)?,
+                })
+            },
         )
     }
 
@@ -69,19 +88,35 @@ impl Action for UpdateAccount {
         }
     }
 
-    fn verify(&self, conn: &Connection, output: &Self::Output) -> Result<Vec<CheckRecord>, Self::Error> {
+    fn verify(
+        &self,
+        conn: &Connection,
+        output: &Self::Output,
+    ) -> Result<Vec<CheckRecord>, Self::Error> {
         let (balance, version): (i64, i64) = conn.query_row(
             "SELECT balance, version FROM account WHERE id = ?1",
             [self.account_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(vec![
-            if balance == self.new_balance { CheckRecord::pass("balance", balance.to_string()) } else { CheckRecord::fail("balance", balance.to_string()) },
-            if version == *output { CheckRecord::pass("version", version.to_string()) } else { CheckRecord::fail("version", version.to_string()) },
+            if balance == self.new_balance {
+                CheckRecord::pass("balance", balance.to_string())
+            } else {
+                CheckRecord::fail("balance", balance.to_string())
+            },
+            if version == *output {
+                CheckRecord::pass("version", version.to_string())
+            } else {
+                CheckRecord::fail("version", version.to_string())
+            },
         ])
     }
 
-    fn rollback(&self, conn: &mut Connection, snapshot: &Self::Snapshot) -> Result<(), Self::Error> {
+    fn rollback(
+        &self,
+        conn: &mut Connection,
+        snapshot: &Self::Snapshot,
+    ) -> Result<(), Self::Error> {
         conn.execute(
             "UPDATE account SET balance = ?1, version = ?2 WHERE id = ?3",
             params![snapshot.balance, snapshot.version, self.account_id],
@@ -89,24 +124,34 @@ impl Action for UpdateAccount {
         Ok(())
     }
 
-    fn verify_rollback(&self, conn: &Connection, snapshot: &Self::Snapshot) -> Result<Vec<CheckRecord>, Self::Error> {
+    fn verify_rollback(
+        &self,
+        conn: &Connection,
+        snapshot: &Self::Snapshot,
+    ) -> Result<Vec<CheckRecord>, Self::Error> {
         let (balance, version): (i64, i64) = conn.query_row(
             "SELECT balance, version FROM account WHERE id = ?1",
             [self.account_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(vec![if balance == snapshot.balance && version == snapshot.version {
-            CheckRecord::pass("rollback_state", "row restored")
-        } else {
-            CheckRecord::fail("rollback_state", "row differs from snapshot")
-        }])
+        Ok(vec![
+            if balance == snapshot.balance && version == snapshot.version {
+                CheckRecord::pass("rollback_state", "row restored")
+            } else {
+                CheckRecord::fail("rollback_state", "row differs from snapshot")
+            },
+        ])
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::open_in_memory()?;
     conn.execute_batch("CREATE TABLE account(id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, version INTEGER NOT NULL); INSERT INTO account VALUES(1, 100, 7);")?;
-    let action = UpdateAccount { account_id: 1, expected_version: 7, new_balance: 125 };
+    let action = UpdateAccount {
+        account_id: 1,
+        expected_version: 7,
+        new_balance: 125,
+    };
     let result = Kernel::default().execute(action, &mut conn)?;
     println!("outcome={:?}", result.outcome);
     Ok(())

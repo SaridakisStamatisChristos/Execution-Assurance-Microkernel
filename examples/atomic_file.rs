@@ -2,7 +2,10 @@ use execution_assurance_microkernel::{
     Action, CheckRecord, CommitStatus, IdempotencyKey, Kernel, Predicate,
 };
 use sha2::{Digest, Sha256};
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug)]
 struct ParentExists(PathBuf);
@@ -10,7 +13,9 @@ struct ParentExists(PathBuf);
 impl Predicate<()> for ParentExists {
     fn evaluate(&self, _ctx: &()) -> CheckRecord {
         match self.0.parent() {
-            Some(parent) if parent.is_dir() => CheckRecord::pass("parent_exists", parent.display().to_string()),
+            Some(parent) if parent.is_dir() => {
+                CheckRecord::pass("parent_exists", parent.display().to_string())
+            }
             _ => CheckRecord::fail("parent_exists", "target parent is missing"),
         }
     }
@@ -44,12 +49,19 @@ impl Action for AtomicReplace {
     type Error = io::Error;
     type Snapshot = Option<Vec<u8>>;
 
-    fn action_id(&self) -> String { format!("replace:{}", self.path.display()) }
-    fn action_type(&self) -> &'static str { "atomic_file_replace" }
+    fn action_id(&self) -> String {
+        format!("replace:{}", self.path.display())
+    }
+    fn action_type(&self) -> &'static str {
+        "atomic_file_replace"
+    }
 
     fn validate(&self, _ctx: &()) -> Result<(), Self::Error> {
         if self.replacement.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "replacement must not be empty"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replacement must not be empty",
+            ));
         }
         Ok(())
     }
@@ -94,7 +106,11 @@ impl Action for AtomicReplace {
         }
     }
 
-    fn verify_rollback(&self, _ctx: &(), snapshot: &Self::Snapshot) -> Result<Vec<CheckRecord>, Self::Error> {
+    fn verify_rollback(
+        &self,
+        _ctx: &(),
+        snapshot: &Self::Snapshot,
+    ) -> Result<Vec<CheckRecord>, Self::Error> {
         let passed = match snapshot {
             Some(bytes) => fs::read(&self.path)? == *bytes,
             None => !self.path.exists(),
@@ -113,9 +129,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = root.join("config.json");
     fs::write(&target, br#"{"version":1}"#)?;
 
-    let action = AtomicReplace { path: target.clone(), replacement: br#"{"version":2}"#.to_vec() };
-    let result = Kernel::default().execute_idempotent(action, &mut (), IdempotencyKey::from("config-v2"))?;
-    println!("outcome={:?} hash={:?}", result.outcome, result.record.record_hash);
+    let action = AtomicReplace {
+        path: target.clone(),
+        replacement: br#"{"version":2}"#.to_vec(),
+    };
+    let result =
+        Kernel::default().execute_idempotent(action, &mut (), IdempotencyKey::from("config-v2"))?;
+    println!(
+        "outcome={:?} hash={:?}",
+        result.outcome, result.record.record_hash
+    );
 
     fs::remove_dir_all(root)?;
     Ok(())

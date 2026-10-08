@@ -11,10 +11,18 @@ impl Action for Increment {
     type Error = Infallible;
     type Snapshot = u64;
 
-    fn action_id(&self) -> String { "bench-increment".to_string() }
-    fn action_type(&self) -> &'static str { "bench_increment" }
-    fn validate(&self, _ctx: &u64) -> Result<(), Self::Error> { Ok(()) }
-    fn snapshot(&self, ctx: &u64) -> Result<Self::Snapshot, Self::Error> { Ok(*ctx) }
+    fn action_id(&self) -> String {
+        "bench-increment".to_string()
+    }
+    fn action_type(&self) -> &'static str {
+        "bench_increment"
+    }
+    fn validate(&self, _ctx: &u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn snapshot(&self, ctx: &u64) -> Result<Self::Snapshot, Self::Error> {
+        Ok(*ctx)
+    }
 
     fn commit(&self, ctx: &mut u64) -> CommitStatus<Self::Output, Self::Error> {
         *ctx += 1;

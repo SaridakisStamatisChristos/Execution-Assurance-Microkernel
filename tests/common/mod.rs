@@ -1,10 +1,13 @@
 use execution_assurance_microkernel::{
     Action, CheckRecord, Clock, CommitStatus, EvidenceStore, FaultInjector, IdGenerator,
-    IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal,
-    Invariant, InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate,
-    ReconciliationResult, SequenceIdGenerator,
+    IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Invariant,
+    InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate, ReconciliationResult,
+    SequenceIdGenerator,
 };
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use thiserror::Error;
 
 #[derive(Debug, Default)]
@@ -78,9 +81,15 @@ impl Action for TestAction {
     type Error = TestError;
     type Snapshot = i32;
 
-    fn action_id(&self) -> String { "test-action".to_string() }
-    fn action_type(&self) -> &'static str { "test_action" }
-    fn validate(&self, _ctx: &World) -> Result<(), Self::Error> { Ok(()) }
+    fn action_id(&self) -> String {
+        "test-action".to_string()
+    }
+    fn action_type(&self) -> &'static str {
+        "test_action"
+    }
+    fn validate(&self, _ctx: &World) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn preconditions(&self) -> Vec<Box<dyn Predicate<World> + '_>> {
         vec![Box::new(Allowed(self.allowed))]
@@ -90,7 +99,9 @@ impl Action for TestAction {
         vec![Box::new(NonNegative)]
     }
 
-    fn snapshot(&self, ctx: &World) -> Result<Self::Snapshot, Self::Error> { Ok(ctx.value) }
+    fn snapshot(&self, ctx: &World) -> Result<Self::Snapshot, Self::Error> {
+        Ok(ctx.value)
+    }
 
     fn commit(&self, ctx: &mut World) -> CommitStatus<Self::Output, Self::Error> {
         match self.commit_behavior {
@@ -103,16 +114,25 @@ impl Action for TestAction {
             CommitBehavior::UnknownCommitted | CommitBehavior::UnknownUnresolved => {
                 ctx.commits += 1;
                 ctx.value += self.delta;
-                CommitStatus::Unknown { reason: "response lost".to_string() }
+                CommitStatus::Unknown {
+                    reason: "response lost".to_string(),
+                }
             }
         }
     }
 
-    fn reconcile(&self, ctx: &mut World) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
+    fn reconcile(
+        &self,
+        ctx: &mut World,
+    ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(match self.commit_behavior {
             CommitBehavior::UnknownCommitted => ReconciliationResult::Committed(ctx.value),
-            CommitBehavior::UnknownUnresolved => ReconciliationResult::Unresolved { reason: "still uncertain".to_string() },
-            CommitBehavior::Confirmed | CommitBehavior::Failed => ReconciliationResult::NotCommitted,
+            CommitBehavior::UnknownUnresolved => ReconciliationResult::Unresolved {
+                reason: "still uncertain".to_string(),
+            },
+            CommitBehavior::Confirmed | CommitBehavior::Failed => {
+                ReconciliationResult::NotCommitted
+            }
         })
     }
 
@@ -132,7 +152,11 @@ impl Action for TestAction {
         Ok(())
     }
 
-    fn verify_rollback(&self, ctx: &World, snapshot: &Self::Snapshot) -> Result<Vec<CheckRecord>, Self::Error> {
+    fn verify_rollback(
+        &self,
+        ctx: &World,
+        snapshot: &Self::Snapshot,
+    ) -> Result<Vec<CheckRecord>, Self::Error> {
         Ok(vec![if ctx.value == *snapshot {
             CheckRecord::pass("rollback_value", ctx.value.to_string())
         } else {
@@ -145,7 +169,9 @@ impl Action for TestAction {
 pub struct TestClock(AtomicU64);
 
 impl Clock for TestClock {
-    fn now_ms(&self) -> u64 { self.0.fetch_add(1, Ordering::SeqCst) }
+    fn now_ms(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 pub fn kernel_with(
