@@ -11,18 +11,10 @@ fn file_journal_survives_reopen_and_preserves_order() {
     {
         let journal = FileJournal::open(&path).unwrap();
         journal
-            .append(JournalEntry {
-                execution_id: "exec-1".to_string(),
-                state: ExecutionState::Prepared,
-                at_ms: 10,
-            })
+            .append(JournalEntry::state("exec-1", ExecutionState::Prepared, 10))
             .unwrap();
         journal
-            .append(JournalEntry {
-                execution_id: "exec-1".to_string(),
-                state: ExecutionState::Committed,
-                at_ms: 11,
-            })
+            .append(JournalEntry::state("exec-1", ExecutionState::Committed, 11))
             .unwrap();
     }
 
@@ -52,11 +44,7 @@ fn recovery_uses_the_latest_durable_state_per_execution() {
         ("b", ExecutionState::RollbackPending, 4),
     ] {
         journal
-            .append(JournalEntry {
-                execution_id: execution_id.to_string(),
-                state,
-                at_ms,
-            })
+            .append(JournalEntry::state(execution_id, state, at_ms))
             .unwrap();
     }
 

@@ -23,6 +23,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets --all-features
+      - name: Doctest
+        run: cargo test --locked --doc --all-features
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings

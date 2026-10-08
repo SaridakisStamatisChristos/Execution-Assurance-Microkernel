@@ -13,9 +13,12 @@ pub enum FailureClass {
     VerificationFailed,
     InvariantViolation,
     RollbackFailed,
+    CompensationUnavailable,
     ReconciliationFailed,
+    RecoveryFailed,
     EvidencePersistenceFailed,
     JournalWriteFailed,
+    ExecutionIdConflict,
     IdempotencyConflict,
     InjectedFault,
 }
@@ -33,6 +36,16 @@ pub enum ExecutionError {
     EvidencePersistence(String),
     #[error("idempotency store failure: {0}")]
     Idempotency(String),
+    #[error("duplicate execution id: {0}")]
+    DuplicateExecutionId(String),
+    #[error("recovery unavailable for execution: {0}")]
+    RecoveryUnavailable(String),
+    #[error("recovery action mismatch: {0}")]
+    RecoveryMismatch(String),
+    #[error("recovery data failure: {0}")]
+    RecoveryData(String),
+    #[error("execution already has terminal evidence: {0}")]
+    AlreadyFinalized(String),
     #[error("fault injected at {0}")]
     InjectedFault(String),
 }

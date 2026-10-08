@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 use execution_assurance_microkernel::{
-    Action, CheckRecord, Clock, CommitStatus, EvidenceStore, FaultInjector, IdGenerator,
-    IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Invariant,
-    InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate, ReconciliationResult,
-    SequenceIdGenerator,
+    Action, CheckRecord, Clock, CommitStatus, CompensationPolicy, EffectPermit, EvidenceStore,
+    FaultInjector, IdGenerator, IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore,
+    InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate,
+    ReconciliationResult, SequenceIdGenerator,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -16,6 +16,7 @@ use thiserror::Error;
 pub struct World {
     pub value: i32,
     pub commits: usize,
+    pub rollbacks: usize,
 }
 
 #[derive(Debug, Error)]
@@ -62,6 +63,8 @@ pub struct TestAction {
     pub allowed: bool,
     pub verify_ok: bool,
     pub rollback_ok: bool,
+    pub partial_rollback: bool,
+    pub compensable: bool,
     pub commit_behavior: CommitBehavior,
 }
 
@@ -72,6 +75,8 @@ impl Default for TestAction {
             allowed: true,
             verify_ok: true,
             rollback_ok: true,
+            partial_rollback: false,
+            compensable: true,
             commit_behavior: CommitBehavior::Confirmed,
         }
     }
@@ -86,9 +91,11 @@ impl Action for TestAction {
     fn action_id(&self) -> String {
         "test-action".to_string()
     }
+
     fn action_type(&self) -> &'static str {
         "test_action"
     }
+
     fn validate(&self, _ctx: &World) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -101,11 +108,23 @@ impl Action for TestAction {
         vec![Box::new(NonNegative)]
     }
 
+    fn compensation_policy(&self) -> CompensationPolicy {
+        if self.compensable {
+            CompensationPolicy::Compensable
+        } else {
+            CompensationPolicy::NonCompensable
+        }
+    }
+
     fn snapshot(&self, ctx: &World) -> Result<Self::Snapshot, Self::Error> {
         Ok(ctx.value)
     }
 
-    fn commit(&self, ctx: &mut World) -> CommitStatus<Self::Output, Self::Error> {
+    fn commit(
+        &self,
+        _permit: &EffectPermit,
+        ctx: &mut World,
+    ) -> CommitStatus<Self::Output, Self::Error> {
         match self.commit_behavior {
             CommitBehavior::Failed => CommitStatus::Failed(TestError("commit failed")),
             CommitBehavior::Confirmed => {
@@ -125,6 +144,7 @@ impl Action for TestAction {
 
     fn reconcile(
         &self,
+        _permit: &EffectPermit,
         ctx: &mut World,
     ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(match self.commit_behavior {
@@ -132,6 +152,9 @@ impl Action for TestAction {
             CommitBehavior::UnknownUnresolved => ReconciliationResult::Unresolved {
                 reason: "still uncertain".to_string(),
             },
+            CommitBehavior::Confirmed if ctx.commits > 0 => {
+                ReconciliationResult::Committed(ctx.value)
+            }
             CommitBehavior::Confirmed | CommitBehavior::Failed => {
                 ReconciliationResult::NotCommitted
             }
@@ -146,7 +169,17 @@ impl Action for TestAction {
         }])
     }
 
-    fn rollback(&self, ctx: &mut World, snapshot: &Self::Snapshot) -> Result<(), Self::Error> {
+    fn rollback(
+        &self,
+        _permit: &EffectPermit,
+        ctx: &mut World,
+        snapshot: &Self::Snapshot,
+    ) -> Result<(), Self::Error> {
+        ctx.rollbacks += 1;
+        if self.partial_rollback {
+            ctx.value = snapshot.saturating_add(1);
+            return Err(TestError("rollback partially failed"));
+        }
         if !self.rollback_ok {
             return Err(TestError("rollback failed"));
         }

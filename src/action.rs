@@ -1,4 +1,33 @@
 use crate::invariant::{Invariant, Predicate};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// Capability token supplied by `Kernel` when it executes effectful lifecycle hooks.
+///
+/// Downstream safe code can name this type to implement [`Action`], but cannot
+/// construct one because its field is crate-private. This keeps `commit`,
+/// `rollback`, and `reconcile` behind the kernel execution boundary.
+///
+/// ```compile_fail
+/// use execution_assurance_microkernel::EffectPermit;
+/// let _permit = EffectPermit { _private: () };
+/// ```
+#[derive(Debug)]
+pub struct EffectPermit {
+    _private: (),
+}
+
+impl EffectPermit {
+    pub(crate) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompensationPolicy {
+    Compensable,
+    NonCompensable,
+}
 
 #[derive(Debug)]
 pub enum CommitStatus<T, E> {
@@ -16,9 +45,9 @@ pub enum ReconciliationResult<T> {
 
 pub trait Action {
     type Context;
-    type Output: Clone + std::fmt::Debug + serde::Serialize;
+    type Output: Clone + std::fmt::Debug + Serialize;
     type Error: std::error::Error + Send + Sync + 'static;
-    type Snapshot: Clone + std::fmt::Debug;
+    type Snapshot: Clone + std::fmt::Debug + Serialize + DeserializeOwned;
 
     fn action_id(&self) -> String;
     fn action_type(&self) -> &'static str;
@@ -32,8 +61,17 @@ pub trait Action {
         Vec::new()
     }
 
+    fn compensation_policy(&self) -> CompensationPolicy {
+        CompensationPolicy::Compensable
+    }
+
     fn snapshot(&self, ctx: &Self::Context) -> Result<Self::Snapshot, Self::Error>;
-    fn commit(&self, ctx: &mut Self::Context) -> CommitStatus<Self::Output, Self::Error>;
+
+    fn commit(
+        &self,
+        permit: &EffectPermit,
+        ctx: &mut Self::Context,
+    ) -> CommitStatus<Self::Output, Self::Error>;
 
     fn verify(
         &self,
@@ -43,6 +81,7 @@ pub trait Action {
 
     fn rollback(
         &self,
+        permit: &EffectPermit,
         ctx: &mut Self::Context,
         snapshot: &Self::Snapshot,
     ) -> Result<(), Self::Error>;
@@ -55,6 +94,7 @@ pub trait Action {
 
     fn reconcile(
         &self,
+        _permit: &EffectPermit,
         _ctx: &mut Self::Context,
     ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(ReconciliationResult::Unresolved {

@@ -1,5 +1,8 @@
-use execution_assurance_microkernel::{Action, CheckRecord, CommitStatus, Kernel, Predicate};
+use execution_assurance_microkernel::{
+    Action, CheckRecord, CommitStatus, EffectPermit, Kernel, Predicate, ReconciliationResult,
+};
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 struct RowVersion {
@@ -27,7 +30,7 @@ impl Predicate<Connection> for RowVersion {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountSnapshot {
     balance: i64,
     version: i64,
@@ -49,9 +52,11 @@ impl Action for UpdateAccount {
     fn action_id(&self) -> String {
         format!("account:{}", self.account_id)
     }
+
     fn action_type(&self) -> &'static str {
         "sqlite_account_update"
     }
+
     fn validate(&self, _ctx: &Connection) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -76,7 +81,11 @@ impl Action for UpdateAccount {
         )
     }
 
-    fn commit(&self, conn: &mut Connection) -> CommitStatus<Self::Output, Self::Error> {
+    fn commit(
+        &self,
+        _permit: &EffectPermit,
+        conn: &mut Connection,
+    ) -> CommitStatus<Self::Output, Self::Error> {
         let changed = conn.execute(
             "UPDATE account SET balance = ?1, version = version + 1 WHERE id = ?2 AND version = ?3",
             params![self.new_balance, self.account_id, self.expected_version],
@@ -86,6 +95,31 @@ impl Action for UpdateAccount {
             Ok(_) => CommitStatus::Failed(rusqlite::Error::QueryReturnedNoRows),
             Err(error) => CommitStatus::Failed(error),
         }
+    }
+
+    fn reconcile(
+        &self,
+        _permit: &EffectPermit,
+        conn: &mut Connection,
+    ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
+        let (balance, version): (i64, i64) = conn.query_row(
+            "SELECT balance, version FROM account WHERE id = ?1",
+            [self.account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(
+            if balance == self.new_balance && version == self.expected_version + 1 {
+                ReconciliationResult::Committed(version)
+            } else if version == self.expected_version {
+                ReconciliationResult::NotCommitted
+            } else {
+                ReconciliationResult::Unresolved {
+                    reason: format!(
+                    "row is at unexpected balance/version {balance}/{version}; cannot infer commit"
+                ),
+                }
+            },
+        )
     }
 
     fn verify(
@@ -114,6 +148,7 @@ impl Action for UpdateAccount {
 
     fn rollback(
         &self,
+        _permit: &EffectPermit,
         conn: &mut Connection,
         snapshot: &Self::Snapshot,
     ) -> Result<(), Self::Error> {

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{basic_kernel, CommitBehavior, TestAction, World};
-use execution_assurance_microkernel::{ExecutionOutcome, ExecutionState};
+use execution_assurance_microkernel::{ExecutionOutcome, ExecutionState, FailureClass};
 
 #[test]
 fn success_requires_verified_postcondition() {
@@ -59,6 +59,7 @@ fn verification_failure_triggers_verified_rollback() {
     let result = basic_kernel().execute(action, &mut world).unwrap();
     assert_eq!(result.outcome, ExecutionOutcome::RolledBack);
     assert_eq!(world.value, 0);
+    assert_eq!(world.rollbacks, 1);
     let rollback = result.record.rollback.unwrap();
     assert!(rollback.succeeded);
     assert!(rollback.verified);
@@ -75,5 +76,47 @@ fn rollback_failure_is_never_hidden() {
     let result = basic_kernel().execute(action, &mut world).unwrap();
     assert_eq!(result.outcome, ExecutionOutcome::RollbackFailed);
     assert_eq!(world.value, 1);
+    assert_eq!(world.rollbacks, 1);
     assert!(!result.record.rollback.unwrap().succeeded);
+}
+
+#[test]
+fn partial_rollback_failure_is_explicit_and_preserves_failed_state() {
+    let mut world = World::default();
+    let action = TestAction {
+        verify_ok: false,
+        partial_rollback: true,
+        ..TestAction::default()
+    };
+    let result = basic_kernel().execute(action, &mut world).unwrap();
+
+    assert_eq!(result.outcome, ExecutionOutcome::RollbackFailed);
+    assert_eq!(world.rollbacks, 1);
+    assert_ne!(world.value, 0);
+    let rollback = result.record.rollback.unwrap();
+    assert!(rollback.attempted);
+    assert!(!rollback.succeeded);
+    assert!(!rollback.verified);
+}
+
+#[test]
+fn non_compensable_action_never_claims_rollback_success() {
+    let mut world = World::default();
+    let action = TestAction {
+        verify_ok: false,
+        compensable: false,
+        ..TestAction::default()
+    };
+    let result = basic_kernel().execute(action, &mut world).unwrap();
+
+    assert_eq!(result.outcome, ExecutionOutcome::RollbackFailed);
+    assert_eq!(world.commits, 1);
+    assert_eq!(world.rollbacks, 0);
+    assert!(matches!(
+        result.record.failure.as_ref().map(|failure| failure.class),
+        Some(FailureClass::CompensationUnavailable)
+    ));
+    let rollback = result.record.rollback.unwrap();
+    assert!(!rollback.attempted);
+    assert!(!rollback.verified);
 }
