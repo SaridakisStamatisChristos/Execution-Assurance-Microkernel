@@ -2,6 +2,15 @@ use crate::invariant::{Invariant, Predicate};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Capability token supplied by `Kernel` when it executes effectful lifecycle hooks.
+///
+/// Downstream safe code can name this type to implement [`Action`], but cannot
+/// construct one because its field is crate-private. This keeps `commit`,
+/// `rollback`, and `reconcile` behind the kernel execution boundary.
+///
+/// ```compile_fail
+/// use execution_assurance_microkernel::EffectPermit;
+/// let _permit = EffectPermit { _private: () };
+/// ```
 #[derive(Debug)]
 pub struct EffectPermit {
     _private: (),
