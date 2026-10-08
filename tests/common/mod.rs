@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 use execution_assurance_microkernel::{
-    Action, CheckRecord, Clock, CommitStatus, EffectPermit, EvidenceStore, FaultInjector,
-    IdGenerator, IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore,
-    InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate,
-    ReconciliationResult, SequenceIdGenerator,
+    Action, CheckRecord, Clock, CommitStatus, CompensationPolicy, EffectPermit, EvidenceStore,
+    FaultInjector, IdGenerator, IdempotencyStore, InMemoryEvidenceStore,
+    InMemoryIdempotencyStore, InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel,
+    NoFaultInjector, Predicate, ReconciliationResult, SequenceIdGenerator,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -64,6 +64,7 @@ pub struct TestAction {
     pub verify_ok: bool,
     pub rollback_ok: bool,
     pub partial_rollback: bool,
+    pub compensable: bool,
     pub commit_behavior: CommitBehavior,
 }
 
@@ -75,6 +76,7 @@ impl Default for TestAction {
             verify_ok: true,
             rollback_ok: true,
             partial_rollback: false,
+            compensable: true,
             commit_behavior: CommitBehavior::Confirmed,
         }
     }
@@ -104,6 +106,14 @@ impl Action for TestAction {
 
     fn invariants(&self) -> Vec<Box<dyn Invariant<World> + '_>> {
         vec![Box::new(NonNegative)]
+    }
+
+    fn compensation_policy(&self) -> CompensationPolicy {
+        if self.compensable {
+            CompensationPolicy::Compensable
+        } else {
+            CompensationPolicy::NonCompensable
+        }
     }
 
     fn snapshot(&self, ctx: &World) -> Result<Self::Snapshot, Self::Error> {
