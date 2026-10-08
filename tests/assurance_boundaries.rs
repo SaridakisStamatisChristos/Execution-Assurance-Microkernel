@@ -2,9 +2,9 @@ mod common;
 
 use common::{kernel_with, TestAction, World};
 use execution_assurance_microkernel::{
-    EvidenceStore, ExecutionError, IdempotencyKey, IdempotencyStore, InMemoryEvidenceStore,
-    InMemoryIdempotencyStore, InMemoryJournal, Journal, JournalEntry, NoFaultInjector,
-    RecoveryManager, RecoveryPlan,
+    EvidenceStore, ExecutionClaimOutcome, ExecutionError, ExecutionState, IdempotencyKey,
+    IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Journal,
+    JournalEntry, NoFaultInjector, RecoveryManager, RecoveryPlan,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -53,12 +53,23 @@ impl EvidenceStore for FailingEvidence {
     ) -> Result<(), String> {
         Err("evidence store unavailable".to_string())
     }
+
+    fn find(
+        &self,
+        _execution_id: &str,
+    ) -> Result<Option<execution_assurance_microkernel::ExecutionRecord>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
 struct FailingIdempotency;
 
 impl IdempotencyStore for FailingIdempotency {
+    fn claim_execution_id(&self, _execution_id: &str) -> Result<ExecutionClaimOutcome, String> {
+        Err("idempotency store unavailable".to_string())
+    }
+
     fn claim(
         &self,
         _key: &IdempotencyKey,
@@ -91,12 +102,14 @@ fn journal_failure_after_the_external_effect_never_becomes_success() {
     let directives = RecoveryManager::scan(journal.as_ref()).unwrap();
     assert_eq!(directives.len(), 1);
     assert_eq!(directives[0].plan, RecoveryPlan::ReconcileBeforeRetry);
+    assert!(directives[0].recovery.is_some());
 }
 
 #[test]
-fn evidence_persistence_failure_is_never_reported_as_success() {
+fn evidence_failure_cannot_leave_a_durable_terminal_state() {
+    let journal = Arc::new(InMemoryJournal::default());
     let kernel = kernel_with(
-        Arc::new(InMemoryJournal::default()),
+        journal.clone(),
         Arc::new(FailingEvidence),
         Arc::new(InMemoryIdempotencyStore::default()),
         Arc::new(NoFaultInjector),
@@ -109,6 +122,9 @@ fn evidence_persistence_failure_is_never_reported_as_success() {
 
     assert!(matches!(error, ExecutionError::EvidencePersistence(_)));
     assert_eq!(world.commits, 1);
+    let entries = journal.entries().unwrap();
+    assert_eq!(entries.last().unwrap().state, ExecutionState::Verified);
+    assert!(!entries.last().unwrap().state.is_terminal());
 }
 
 #[test]
@@ -121,13 +137,7 @@ fn idempotency_store_failure_fails_before_the_effect() {
     );
     let mut world = World::default();
 
-    let error = kernel
-        .execute_idempotent(
-            TestAction::default(),
-            &mut world,
-            IdempotencyKey::from("key"),
-        )
-        .unwrap_err();
+    let error = kernel.execute(TestAction::default(), &mut world).unwrap_err();
 
     assert!(matches!(error, ExecutionError::Idempotency(_)));
     assert_eq!(world.commits, 0);
