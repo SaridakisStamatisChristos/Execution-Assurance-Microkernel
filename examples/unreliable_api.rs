@@ -1,5 +1,5 @@
 use execution_assurance_microkernel::{
-    Action, CheckRecord, CommitStatus, Kernel, ReconciliationResult,
+    Action, CheckRecord, CommitStatus, EffectPermit, Kernel, ReconciliationResult,
 };
 use std::{collections::HashMap, convert::Infallible};
 
@@ -24,9 +24,11 @@ impl Action for CreateResource {
     fn action_id(&self) -> String {
         format!("remote:{}", self.id)
     }
+
     fn action_type(&self) -> &'static str {
         "fake_remote_create"
     }
+
     fn validate(&self, _ctx: &FakeApi) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -35,7 +37,11 @@ impl Action for CreateResource {
         Ok(api.resources.get(&self.id).cloned())
     }
 
-    fn commit(&self, api: &mut FakeApi) -> CommitStatus<Self::Output, Self::Error> {
+    fn commit(
+        &self,
+        _permit: &EffectPermit,
+        api: &mut FakeApi,
+    ) -> CommitStatus<Self::Output, Self::Error> {
         api.resources.insert(self.id.clone(), self.body.clone());
         if api.lose_next_response {
             api.lose_next_response = false;
@@ -49,6 +55,7 @@ impl Action for CreateResource {
 
     fn reconcile(
         &self,
+        _permit: &EffectPermit,
         api: &mut FakeApi,
     ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(match api.resources.get(&self.id) {
@@ -77,7 +84,12 @@ impl Action for CreateResource {
         ])
     }
 
-    fn rollback(&self, api: &mut FakeApi, snapshot: &Self::Snapshot) -> Result<(), Self::Error> {
+    fn rollback(
+        &self,
+        _permit: &EffectPermit,
+        api: &mut FakeApi,
+        snapshot: &Self::Snapshot,
+    ) -> Result<(), Self::Error> {
         match snapshot {
             Some(body) => {
                 api.resources.insert(self.id.clone(), body.clone());
