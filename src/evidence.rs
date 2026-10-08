@@ -117,6 +117,7 @@ pub struct ExecutionRecord {
     pub reconciliation: Option<ReconciliationRecord>,
     pub verification: Option<VerificationRecord>,
     pub rollback: Option<RollbackRecord>,
+    #[serde(default)]
     pub recovery: Option<RecoveryRecord>,
     pub failure: Option<FailureRecord>,
     pub outcome: ExecutionOutcome,
@@ -274,20 +275,33 @@ impl ConservativeRedactor {
                 redacted = redacted.replace(secret, "[REDACTED]");
             }
         }
-        for marker in ["password=", "token=", "secret=", "api_key=", "authorization="] {
+        for marker in [
+            "password=",
+            "token=",
+            "secret=",
+            "api_key=",
+            "authorization=",
+        ] {
+            let mut cursor = 0;
             loop {
-                let lower = redacted.to_ascii_lowercase();
-                let Some(start) = lower.find(marker) else {
+                if cursor >= redacted.len() {
+                    break;
+                }
+                let lower_tail = redacted[cursor..].to_ascii_lowercase();
+                let Some(relative_start) = lower_tail.find(marker) else {
                     break;
                 };
+                let start = cursor + relative_start;
                 let value_start = start + marker.len();
                 let end = redacted[value_start..]
                     .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '&'))
                     .map_or(redacted.len(), |offset| value_start + offset);
                 if value_start == end {
-                    break;
+                    cursor = value_start;
+                    continue;
                 }
                 redacted.replace_range(value_start..end, "[REDACTED]");
+                cursor = value_start + "[REDACTED]".len();
             }
         }
         redacted
