@@ -87,7 +87,6 @@ pub trait Action {
         &self,
         _permit: &EffectPermit,
         _ctx: &mut Self::Context,
-        _snapshot: Option<&Self::Snapshot>,
     ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(ReconciliationResult::Unresolved {
             reason: "no reconciliation strategy supplied".to_string(),
