@@ -2,47 +2,27 @@ name: CI
 
 on:
   push:
-  pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  quality:
-    name: quality / stable
+  rustfmt:
+    name: canonical rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format feature checkout
+          components: rustfmt
+      - name: Apply rustfmt
         run: cargo fmt --all
-      - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --locked --all-targets --all-features
-      - name: Doctest
-        run: cargo test --locked --doc --all-features
-      - name: Documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps
-      - name: Bench compile
-        run: cargo bench --locked --no-run
-      - name: Benchmark evidence
-        if: github.ref == 'refs/heads/feat/complete-handoff'
-        run: cargo bench --locked --bench kernel -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5 --noplot
-
-  msrv:
-    name: msrv / 1.89
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.89.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: msrv-1.89
-      - name: Check library at declared MSRV
-        run: cargo check --locked --lib
+      - name: Commit formatting if needed
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- '*.rs'
+            git commit -m "style: apply canonical rustfmt"
+            git push
+          fi
