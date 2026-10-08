@@ -54,8 +54,6 @@ impl Action for CreateResource {
     ) -> CommitStatus<Self::Output, Self::Error> {
         api.requests += 1;
 
-        // The fake service treats an identical create as a server-side duplicate,
-        // returning the same resource identity without applying a second write.
         if api.resources.get(&self.id) == Some(&self.body) {
             return CommitStatus::Confirmed(self.id.clone());
         }
@@ -148,6 +146,12 @@ impl Action for CreateResource {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _supported_adversarial_modes = [
+        RemoteMode::Normal,
+        RemoteMode::TimeoutBeforeApply,
+        RemoteMode::LostResponseAfterApply,
+        RemoteMode::PartialWrite,
+    ];
     let mut api = FakeApi::default();
     let action = CreateResource {
         id: "r-42".to_string(),
