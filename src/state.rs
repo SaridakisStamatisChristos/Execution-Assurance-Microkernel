@@ -23,12 +23,7 @@ impl ExecutionState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Finalized
-                | Self::Rejected
-                | Self::Aborted
-                | Self::RolledBack
-                | Self::Failed
-                | Self::ReconciliationRequired
+            Self::Finalized | Self::Rejected | Self::Aborted | Self::RolledBack | Self::Failed
         )
     }
 
@@ -77,6 +72,10 @@ impl ExecutionTrace {
             state: ExecutionState::Created,
             transitions: Vec::new(),
         }
+    }
+
+    pub(crate) fn state(&self) -> ExecutionState {
+        self.state
     }
 
     pub(crate) fn transitions(&self) -> &[StateTransition] {
