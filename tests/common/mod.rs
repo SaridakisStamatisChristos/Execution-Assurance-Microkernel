@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use execution_assurance_microkernel::{
-    Action, CheckRecord, Clock, CommitStatus, EvidenceStore, FaultInjector, IdGenerator,
+    Action, CheckRecord, Clock, CommitStatus, EffectPermit, EvidenceStore, FaultInjector, IdGenerator,
     IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore, InMemoryJournal, Invariant,
     InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate, ReconciliationResult,
     SequenceIdGenerator,
@@ -86,9 +86,11 @@ impl Action for TestAction {
     fn action_id(&self) -> String {
         "test-action".to_string()
     }
+
     fn action_type(&self) -> &'static str {
         "test_action"
     }
+
     fn validate(&self, _ctx: &World) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -105,7 +107,11 @@ impl Action for TestAction {
         Ok(ctx.value)
     }
 
-    fn commit(&self, ctx: &mut World) -> CommitStatus<Self::Output, Self::Error> {
+    fn commit(
+        &self,
+        _permit: &EffectPermit,
+        ctx: &mut World,
+    ) -> CommitStatus<Self::Output, Self::Error> {
         match self.commit_behavior {
             CommitBehavior::Failed => CommitStatus::Failed(TestError("commit failed")),
             CommitBehavior::Confirmed => {
@@ -125,6 +131,7 @@ impl Action for TestAction {
 
     fn reconcile(
         &self,
+        _permit: &EffectPermit,
         ctx: &mut World,
     ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
         Ok(match self.commit_behavior {
@@ -132,9 +139,8 @@ impl Action for TestAction {
             CommitBehavior::UnknownUnresolved => ReconciliationResult::Unresolved {
                 reason: "still uncertain".to_string(),
             },
-            CommitBehavior::Confirmed | CommitBehavior::Failed => {
-                ReconciliationResult::NotCommitted
-            }
+            CommitBehavior::Confirmed => ReconciliationResult::Committed(ctx.value),
+            CommitBehavior::Failed => ReconciliationResult::NotCommitted,
         })
     }
 
@@ -146,7 +152,12 @@ impl Action for TestAction {
         }])
     }
 
-    fn rollback(&self, ctx: &mut World, snapshot: &Self::Snapshot) -> Result<(), Self::Error> {
+    fn rollback(
+        &self,
+        _permit: &EffectPermit,
+        ctx: &mut World,
+        snapshot: &Self::Snapshot,
+    ) -> Result<(), Self::Error> {
         if !self.rollback_ok {
             return Err(TestError("rollback failed"));
         }
