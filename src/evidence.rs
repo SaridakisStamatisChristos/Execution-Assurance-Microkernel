@@ -1,8 +1,10 @@
-use crate::{error::FailureClass, state::StateTransition, ExecutionState};
+use crate::{
+    durable_log::open_durable_jsonl, error::FailureClass, state::StateTransition, ExecutionState,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -53,6 +55,11 @@ pub struct CommitRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecord {
     pub passed: bool,
+    /// `true` means verification could not establish either success or
+    /// failure because the observation path itself failed. This is not an
+    /// explicit failed postcondition and must not trigger compensation.
+    #[serde(default)]
+    pub indeterminate: bool,
     pub checks: Vec<CheckRecord>,
     pub detail: String,
 }
@@ -94,6 +101,7 @@ pub enum ExecutionOutcome {
     Aborted,
     CommitFailed,
     ReconciliationRequired,
+    VerificationRequired,
     RolledBack,
     RollbackFailed,
 }
@@ -205,11 +213,7 @@ pub struct JsonlEvidenceStore {
 impl JsonlEvidenceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let file = open_durable_jsonl(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(file),

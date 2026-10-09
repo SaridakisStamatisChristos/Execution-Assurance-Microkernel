@@ -4,7 +4,10 @@ use common::{basic_kernel, TestAction, World};
 use execution_assurance_microkernel::{
     CheckRecord, ConservativeRedactor, EvidenceRedactor, EvidenceStore, JsonlEvidenceStore,
 };
-use std::fs;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+};
 use uuid::Uuid;
 
 #[test]
@@ -107,6 +110,60 @@ fn raw_secrets_are_redacted_before_durable_evidence() {
     }
     assert!(text.contains("[REDACTED]"));
     assert!(record.verify_hash().unwrap());
+
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn torn_final_evidence_frame_is_truncated_without_losing_prior_records() {
+    let mut world = World::default();
+    let record = basic_kernel()
+        .execute(TestAction::default(), &mut world)
+        .unwrap()
+        .record;
+    let path = std::env::temp_dir().join(format!("eamk-torn-evidence-{}.jsonl", Uuid::new_v4()));
+
+    {
+        let store = JsonlEvidenceStore::open(&path).unwrap();
+        store.persist(&record).unwrap();
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(br#"{"schema_version":3,"execution_id":"torn"#)
+        .unwrap();
+
+    let repaired = JsonlEvidenceStore::open(&path).unwrap();
+    let found = repaired.find(&record.execution_id).unwrap().unwrap();
+    assert_eq!(found.execution_id, record.execution_id);
+    assert!(found.verify_hash().unwrap());
+
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn malformed_newline_terminated_evidence_frame_fails_closed() {
+    let mut world = World::default();
+    let record = basic_kernel()
+        .execute(TestAction::default(), &mut world)
+        .unwrap()
+        .record;
+    let path = std::env::temp_dir().join(format!("eamk-corrupt-evidence-{}.jsonl", Uuid::new_v4()));
+
+    {
+        let store = JsonlEvidenceStore::open(&path).unwrap();
+        store.persist(&record).unwrap();
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{not-valid-json}\n")
+        .unwrap();
+
+    let reopened = JsonlEvidenceStore::open(&path).unwrap();
+    assert!(reopened.find(&record.execution_id).is_err());
 
     fs::remove_file(path).unwrap();
 }

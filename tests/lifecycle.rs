@@ -100,6 +100,30 @@ fn partial_rollback_failure_is_explicit_and_preserves_failed_state() {
 }
 
 #[test]
+fn compensation_conflict_is_explicit_and_preserves_external_state() {
+    let mut world = World::default();
+    let action = TestAction {
+        verify_ok: false,
+        rollback_conflict: true,
+        ..TestAction::default()
+    };
+    let result = basic_kernel().execute(action, &mut world).unwrap();
+
+    assert_eq!(result.outcome, ExecutionOutcome::RollbackFailed);
+    assert_eq!(world.commits, 1);
+    assert_eq!(world.rollbacks, 1);
+    assert_eq!(world.value, 1);
+    assert!(matches!(
+        result.record.failure.as_ref().map(|failure| failure.class),
+        Some(FailureClass::CompensationConflict)
+    ));
+    let rollback = result.record.rollback.unwrap();
+    assert!(rollback.attempted);
+    assert!(!rollback.succeeded);
+    assert!(!rollback.verified);
+}
+
+#[test]
 fn non_compensable_action_never_claims_rollback_success() {
     let mut world = World::default();
     let action = TestAction {

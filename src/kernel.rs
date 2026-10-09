@@ -1,5 +1,8 @@
 use crate::{
-    action::{Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult},
+    action::{
+        Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult,
+        RollbackStatus,
+    },
     error::{ExecutionError, FailureClass},
     evidence::{
         CheckRecord, CommitDisposition, CommitRecord, ConservativeRedactor, EvidenceRedactor,
@@ -337,6 +340,7 @@ impl Kernel {
                 };
                 record.verification = Some(VerificationRecord {
                     passed: true,
+                    indeterminate: false,
                     checks: vec![CheckRecord::pass(
                         "durable_verified_marker",
                         "postconditions were durably marked verified before interruption",
@@ -757,6 +761,7 @@ impl Kernel {
             Ok(checks) if checks.iter().all(|check| check.passed) => {
                 record.verification = Some(VerificationRecord {
                     passed: true,
+                    indeterminate: false,
                     checks,
                     detail: "postconditions verified".to_string(),
                 });
@@ -768,6 +773,7 @@ impl Kernel {
                 );
                 record.verification = Some(VerificationRecord {
                     passed: false,
+                    indeterminate: false,
                     checks,
                     detail: detail.clone(),
                 });
@@ -778,16 +784,23 @@ impl Kernel {
                 return self.rollback_after_failure(action, ctx, snapshot, record, trace);
             }
             Err(error) => {
+                let detail = error.to_string();
                 record.verification = Some(VerificationRecord {
                     passed: false,
+                    indeterminate: true,
                     checks: Vec::new(),
-                    detail: error.to_string(),
+                    detail: detail.clone(),
                 });
                 record.failure = Some(FailureRecord {
-                    class: FailureClass::VerificationFailed,
-                    message: error.to_string(),
+                    class: FailureClass::VerificationIndeterminate,
+                    message: detail,
                 });
-                return self.rollback_after_failure(action, ctx, snapshot, record, trace);
+                return self.persist_checkpoint(
+                    record,
+                    trace,
+                    ExecutionOutcome::VerificationRequired,
+                    Some(output),
+                );
             }
         }
 
@@ -795,7 +808,7 @@ impl Kernel {
         debug_assert!(record
             .verification
             .as_ref()
-            .is_some_and(|value| value.passed));
+            .is_some_and(|value| value.passed && !value.indeterminate));
         debug_assert!(matches!(
             record.commit.disposition,
             CommitDisposition::Confirmed | CommitDisposition::ReconciledCommitted
@@ -841,25 +854,48 @@ impl Kernel {
         self.transition(&record.execution_id, trace, ExecutionState::RollbackPending)?;
         self.fault(FaultPoint::DuringRollback)?;
         let permit = EffectPermit::new();
-        if let Err(error) = action.rollback(&permit, ctx, snapshot) {
-            record.rollback = Some(RollbackRecord {
-                attempted: true,
-                succeeded: false,
-                verified: false,
-                checks: Vec::new(),
-                detail: error.to_string(),
-            });
-            record.failure = Some(FailureRecord {
-                class: FailureClass::RollbackFailed,
-                message: error.to_string(),
-            });
-            return self.finish_terminal(
-                record,
-                trace,
-                ExecutionState::Failed,
-                ExecutionOutcome::RollbackFailed,
-                None,
-            );
+        match action.rollback_status(&permit, ctx, snapshot) {
+            RollbackStatus::Succeeded => {}
+            RollbackStatus::Failed(error) => {
+                record.rollback = Some(RollbackRecord {
+                    attempted: true,
+                    succeeded: false,
+                    verified: false,
+                    checks: Vec::new(),
+                    detail: error.to_string(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::RollbackFailed,
+                    message: error.to_string(),
+                });
+                return self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::RollbackFailed,
+                    None,
+                );
+            }
+            RollbackStatus::Conflict { reason } => {
+                record.rollback = Some(RollbackRecord {
+                    attempted: true,
+                    succeeded: false,
+                    verified: false,
+                    checks: Vec::new(),
+                    detail: reason.clone(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::CompensationConflict,
+                    message: reason,
+                });
+                return self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::RollbackFailed,
+                    None,
+                );
+            }
         }
         self.fault(FaultPoint::AfterRollback)?;
         self.verify_rollback(action, ctx, snapshot, record, trace, true)
@@ -923,25 +959,48 @@ impl Kernel {
         }
 
         let permit = EffectPermit::new();
-        if let Err(error) = action.rollback(&permit, ctx, snapshot) {
-            record.rollback = Some(RollbackRecord {
-                attempted: true,
-                succeeded: false,
-                verified: false,
-                checks: Vec::new(),
-                detail: error.to_string(),
-            });
-            record.failure = Some(FailureRecord {
-                class: FailureClass::RollbackFailed,
-                message: error.to_string(),
-            });
-            return self.finish_terminal(
-                record,
-                trace,
-                ExecutionState::Failed,
-                ExecutionOutcome::RollbackFailed,
-                None,
-            );
+        match action.rollback_status(&permit, ctx, snapshot) {
+            RollbackStatus::Succeeded => {}
+            RollbackStatus::Failed(error) => {
+                record.rollback = Some(RollbackRecord {
+                    attempted: true,
+                    succeeded: false,
+                    verified: false,
+                    checks: Vec::new(),
+                    detail: error.to_string(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::RollbackFailed,
+                    message: error.to_string(),
+                });
+                return self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::RollbackFailed,
+                    None,
+                );
+            }
+            RollbackStatus::Conflict { reason } => {
+                record.rollback = Some(RollbackRecord {
+                    attempted: true,
+                    succeeded: false,
+                    verified: false,
+                    checks: Vec::new(),
+                    detail: reason.clone(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::CompensationConflict,
+                    message: reason,
+                });
+                return self.finish_terminal(
+                    record,
+                    trace,
+                    ExecutionState::Failed,
+                    ExecutionOutcome::RollbackFailed,
+                    None,
+                );
+            }
         }
         self.verify_rollback(action, ctx, snapshot, record, trace, true)
     }
@@ -1073,7 +1132,7 @@ impl Kernel {
         started_at_ms: u64,
     ) -> ExecutionRecord {
         ExecutionRecord {
-            schema_version: 2,
+            schema_version: 3,
             execution_id,
             action_id: action.action_id(),
             action_type: action.action_type().to_string(),

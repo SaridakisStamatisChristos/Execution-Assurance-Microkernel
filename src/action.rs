@@ -43,6 +43,18 @@ pub enum ReconciliationResult<T> {
     Unresolved { reason: String },
 }
 
+/// Result of attempting compensation.
+///
+/// `Conflict` is semantically distinct from an implementation failure: the
+/// action deliberately refused to restore its snapshot because the current
+/// external state can no longer be attributed to this execution.
+#[derive(Debug)]
+pub enum RollbackStatus<E> {
+    Succeeded,
+    Failed(E),
+    Conflict { reason: String },
+}
+
 pub trait Action {
     type Context;
     type Output: Clone + std::fmt::Debug + Serialize;
@@ -85,6 +97,24 @@ pub trait Action {
         ctx: &mut Self::Context,
         snapshot: &Self::Snapshot,
     ) -> Result<(), Self::Error>;
+
+    /// Compensation hook with explicit conflict semantics.
+    ///
+    /// Existing actions that only implement [`Action::rollback`] retain the
+    /// original behavior. Actions that can prove ownership of the state they
+    /// are about to restore may override this method and return `Conflict`
+    /// rather than overwriting state changed by another actor.
+    fn rollback_status(
+        &self,
+        permit: &EffectPermit,
+        ctx: &mut Self::Context,
+        snapshot: &Self::Snapshot,
+    ) -> RollbackStatus<Self::Error> {
+        match self.rollback(permit, ctx, snapshot) {
+            Ok(()) => RollbackStatus::Succeeded,
+            Err(error) => RollbackStatus::Failed(error),
+        }
+    }
 
     fn verify_rollback(
         &self,
