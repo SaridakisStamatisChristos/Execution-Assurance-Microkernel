@@ -155,9 +155,20 @@ impl ExecutionRecord {
     fn compute_hash(&self) -> Result<String, serde_json::Error> {
         let mut unsigned = self.clone();
         unsigned.record_hash = None;
-        let canonical = serde_json::to_vec(&unsigned)?;
+
+        // Schema 3 predates rollback-verification indeterminacy and schema 2
+        // predates ordinary verification indeterminacy. Preserve their exact
+        // historical serialized shape when validating an older sealed record.
+        let mut canonical = serde_json::to_string(&unsigned)?;
+        if unsigned.schema_version < 4 {
+            canonical = canonical.replacen(",\"verification_indeterminate\":false", "", 1);
+        }
+        if unsigned.schema_version < 3 {
+            canonical = canonical.replacen(",\"indeterminate\":false", "", 1);
+        }
+
         let mut hasher = Sha256::new();
-        hasher.update(canonical);
+        hasher.update(canonical.as_bytes());
         Ok(format!("{:x}", hasher.finalize()))
     }
 }

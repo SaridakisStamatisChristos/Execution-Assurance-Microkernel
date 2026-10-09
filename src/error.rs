@@ -37,10 +37,14 @@ pub enum ExecutionError {
     Journal(String),
     #[error("evidence persistence failure: {0}")]
     EvidencePersistence(String),
+    #[error("evidence integrity failure: {0}")]
+    EvidenceIntegrity(String),
     #[error("idempotency store failure: {0}")]
     Idempotency(String),
     #[error("duplicate execution id: {0}")]
     DuplicateExecutionId(String),
+    #[error("recovery already in progress for execution: {0}")]
+    RecoveryInProgress(String),
     #[error("recovery unavailable for execution: {0}")]
     RecoveryUnavailable(String),
     #[error("recovery action mismatch: {0}")]

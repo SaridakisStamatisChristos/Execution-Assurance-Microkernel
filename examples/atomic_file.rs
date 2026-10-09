@@ -29,6 +29,19 @@ struct AtomicReplace {
 }
 
 impl AtomicReplace {
+    #[cfg(unix)]
+    fn sync_parent(path: &Path) -> io::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory")
+        })?;
+        fs::File::open(parent)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_parent(_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let tmp = path.with_extension("execution-microkernel.tmp");
         let mut options = fs::OpenOptions::new();
@@ -36,7 +49,8 @@ impl AtomicReplace {
         let mut file = options.create(true).truncate(true).write(true).open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(tmp, path)
+        fs::rename(tmp, path)?;
+        Self::sync_parent(path)
     }
 
     fn hash(bytes: &[u8]) -> String {
@@ -65,7 +79,7 @@ impl AtomicReplace {
         let restored = match snapshot {
             Some(bytes) => Self::replace(&self.path, bytes),
             None => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
+                Ok(()) => Self::sync_parent(&self.path),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             },
@@ -253,6 +267,24 @@ mod tests {
         let status = action.rollback_if_owned(&snapshot);
         assert!(matches!(status, RollbackStatus::Succeeded));
         assert_eq!(fs::read(&path).unwrap(), b"before");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_committed_file_completes_compensation() {
+        let root = std::env::temp_dir().join(format!("eamk-file-remove-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"ours").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+
+        let status = action.rollback_if_owned(&None);
+        assert!(matches!(status, RollbackStatus::Succeeded));
+        assert!(!path.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
