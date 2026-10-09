@@ -14,6 +14,7 @@ pub enum FailureClass {
     VerificationIndeterminate,
     InvariantViolation,
     RollbackFailed,
+    RollbackVerificationIndeterminate,
     CompensationUnavailable,
     CompensationConflict,
     ReconciliationFailed,

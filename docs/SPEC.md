@@ -20,7 +20,7 @@ Success(e) := CommitEstablished(e) AND PostconditionsVerified(e)
 
 `CommitEstablished` means either the commit returned `Confirmed(output)` or reconciliation independently established that the effect exists. A transport success, method return, HTTP 2xx, or database driver `Ok` is not sufficient evidence of semantic success.
 
-Verification is also epistemic: an explicit failed postcondition is different from an unavailable observer. The latter remains recoverable and never causes automatic compensation.
+Verification is epistemic: an explicit failed postcondition is different from an unavailable observer. The same rule applies to rollback verification: an unavailable rollback observer is not proof that compensation failed or proof that it must be repeated.
 
 ## 3. Public execution boundary
 
@@ -56,9 +56,11 @@ For a new execution, the kernel:
 15. if verification explicitly disproves the postcondition, applies compensation policy;
 16. if the verification observer itself fails, records `VerificationRequired` while leaving the durable head at `Committed` and performs no rollback;
 17. if compensation is attempted, distinguishes success, implementation failure, and ownership conflict;
-18. verifies successful compensation and post-rollback invariants;
-19. redacts and seals evidence;
-20. persists evidence before writing any terminal journal state.
+18. independently verifies compensation and post-rollback invariants;
+19. if rollback verification itself is unavailable while rollback invariants still hold, records `RollbackVerificationRequired`, leaves the durable head at `RollbackPending`, and does not repeat compensation solely because the observer failed;
+20. on recovery from `RollbackPending`, verifies first; only an explicit negative rollback observation/invariant permits the normal compensation retry path;
+21. redacts and seals evidence;
+22. persists evidence before writing any terminal journal state.
 
 ## 5. State machine
 
@@ -80,6 +82,8 @@ Failed
 ```
 
 `ReconciliationRequired` is nonterminal. Verification-observer uncertainty does not require a new durable state: the journal remains at `Committed`, evidence records `VerificationRequired`, and recovery re-establishes output before verification is attempted again.
+
+Rollback-verification uncertainty is also nonterminal without a new durable state: the journal remains at `RollbackPending`, evidence records `RollbackVerificationRequired`, and recovery re-runs rollback observation before considering another compensation attempt.
 
 Only transitions encoded by `ExecutionState::can_transition_to` are legal.
 
@@ -194,6 +198,25 @@ An action that can detect that its committed state has been replaced by another 
 
 Ownership checks are action-specific. The SQLite reference action enforces the check atomically in the conditional `UPDATE`. The file reference action re-reads and compares current content before restoration; ordinary conflicting changes are refused, but a filesystem without compare-and-swap/fencing cannot make a universal distributed ownership guarantee across the check-and-replace interval.
 
+### K11 — Indeterminate rollback verification cannot repeat compensation
+
+```text
+rollback_verification_observer_error
+=> outcome = RollbackVerificationRequired
+   AND durable_head = RollbackPending
+   AND no_additional_rollback_attempt_from_observer_error
+```
+
+`Action::verify_rollback` is interpreted epistemically:
+
+```text
+Ok(all checks pass) -> rollback verified
+Ok(any check fails) -> explicit negative rollback observation
+Err(observer error) -> rollback verification indeterminate
+```
+
+The third case does not prove rollback failed. On recovery from `RollbackPending`, the kernel runs rollback verification before calling `rollback_status`. If observation is still unavailable and post-rollback invariants do not explicitly fail, the execution remains recoverable at `RollbackPending` and compensation is not repeated. A later explicit negative rollback observation or failed rollback invariant may enter the normal compensation retry/conflict path.
+
 ## 8. Commit outcomes and reconciliation
 
 `Action::commit` returns:
@@ -210,7 +233,7 @@ CommitStatus::Unknown { reason }
 
 Successful commit establishment is necessary but insufficient for success. Verification should independently observe the resulting world.
 
-A verifier error is represented in schema-version-3 evidence as `VerificationRecord { passed: false, indeterminate: true, ... }` with `FailureClass::VerificationIndeterminate` and `ExecutionOutcome::VerificationRequired`. The durable journal head remains `Committed` so restart recovery can safely re-establish output through reconciliation and attempt verification again.
+A verifier error is represented in evidence as `VerificationRecord { passed: false, indeterminate: true, ... }` with `FailureClass::VerificationIndeterminate` and `ExecutionOutcome::VerificationRequired`. The durable journal head remains `Committed` so restart recovery can safely re-establish output through reconciliation and attempt verification again.
 
 An explicit failed check has `indeterminate = false`; it is a real negative observation and may enter compensation.
 
@@ -220,9 +243,15 @@ Every action declares `Compensable` or `NonCompensable`. Existing actions may im
 
 Actions that can detect interference override `rollback_status` and return `Conflict`. A conflict is terminally recorded as a failed compensation attempt rather than overwriting newer state or claiming rollback success.
 
+A successful rollback hook is not terminal proof. Rollback postconditions and post-rollback invariants must pass. If `verify_rollback` returns an observer error while the invariant checks do not explicitly fail, evidence records `FailureClass::RollbackVerificationIndeterminate`, `RollbackRecord.verification_indeterminate = true`, and `ExecutionOutcome::RollbackVerificationRequired`. The durable journal remains `RollbackPending`.
+
+Recovery from `RollbackPending` follows verify-before-act semantics: verify first; finalize if rollback is observed complete; remain pending if observation is unavailable; only after an explicit negative observation/invariant does the normal compensation retry path execute.
+
 ## 11. Evidence
 
-`ExecutionRecord` schema version 3 contains execution/action/idempotency identity, timestamps, transitions, validation/precondition/invariant checks, commit disposition, reconciliation, verification including indeterminate status, rollback, recovery metadata, failure classification, final outcome, and a SHA-256 record hash.
+`ExecutionRecord` schema version 4 contains execution/action/idempotency identity, timestamps, transitions, validation/precondition/invariant checks, commit disposition, reconciliation, verification including indeterminate status, rollback including rollback-verification indeterminacy, recovery metadata, failure classification, final outcome, and a SHA-256 record hash.
+
+`RollbackRecord.verification_indeterminate` uses `#[serde(default)]` so earlier serialized records lacking the field can still be decoded by the current schema shape.
 
 Before sealing, `EvidenceRedactor` runs. `JsonlEvidenceStore` appends a newline-delimited frame, flushes, and calls `sync_data()`.
 
@@ -251,11 +280,13 @@ The `Prepared` journal entry carries the recovery envelope containing action ide
 | `Prepared` | reconcile before retry |
 | `ReconciliationRequired` | reconcile again; never commit |
 | `Committed` | re-establish/read back output, then verify; compensate only after explicit failed verification/invariant |
-| `RollbackPending` | verify whether rollback completed; otherwise resume it |
+| `RollbackPending` | verify rollback first; finalize if observed complete; remain pending if observer unavailable; retry compensation only after explicit negative evidence |
 | `Verified` | finalize without repeating effect |
 | terminal state | no recovery action |
 
 A prior `VerificationRequired` result has durable head `Committed`, so it naturally follows the `Committed` recovery plan. Repeated observer failure remains recoverable and neither increments commit count nor begins compensation.
+
+A prior `RollbackVerificationRequired` result has durable head `RollbackPending`, so it naturally follows the `RollbackPending` recovery plan. Repeated rollback-observer failure remains recoverable and does not increment rollback count.
 
 If terminal evidence exists but the terminal journal append was lost, recovery returns `AlreadyFinalized` rather than repeating the effect.
 
@@ -269,6 +300,10 @@ Additional deterministic regressions cover:
 - repeated verifier unavailability across recovery;
 - later verification success without second commit;
 - later explicit verification failure followed by compensation;
+- rollback verification unavailable after compensation succeeded;
+- repeated rollback-verifier unavailability without a second compensation;
+- later rollback observation finalizing without a second compensation;
+- explicit negative rollback observation allowing the normal compensation retry path;
 - torn final journal and evidence frames;
 - committed malformed JSON failing closed;
 - append/reopen after tail repair;
@@ -288,7 +323,7 @@ The file example cannot distinguish an independent writer that produces byte-ide
 
 ## 16. Benchmarks
 
-`benches/kernel.rs` separates core verified success, explicit verification failure followed by verified rollback, and durable fsync-backed success. CI compiles the benchmark target on every change. Published measurements are environment-specific, not universal latency guarantees.
+`benches/kernel.rs` separates core verified success, explicit verification failure followed by verified rollback, and durable fsync-backed success. CI compiles the benchmark target on every change. Published measurements are environment-specific, not universal latency guarantees. Measurements that predate semantic hardening are historical observations rather than exact-current-head performance evidence.
 
 ## 17. Non-goals and limits
 
@@ -296,4 +331,4 @@ The kernel does not claim distributed exactly-once execution, consensus, distrib
 
 Recovery requires the caller to re-supply the matching action and current context. Durable journal snapshots are application state and may contain sensitive data.
 
-The design intentionally favors explicit unresolved or conflicted states over unsafe inference.
+The design intentionally favors explicit unresolved, indeterminate, or conflicted states over unsafe inference.

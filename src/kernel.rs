@@ -835,6 +835,7 @@ impl Kernel {
                 attempted: false,
                 succeeded: false,
                 verified: false,
+                verification_indeterminate: false,
                 checks: Vec::new(),
                 detail: "action declares no compensating rollback".to_string(),
             });
@@ -861,6 +862,7 @@ impl Kernel {
                     attempted: true,
                     succeeded: false,
                     verified: false,
+                    verification_indeterminate: false,
                     checks: Vec::new(),
                     detail: error.to_string(),
                 });
@@ -881,6 +883,7 @@ impl Kernel {
                     attempted: true,
                     succeeded: false,
                     verified: false,
+                    verification_indeterminate: false,
                     checks: Vec::new(),
                     detail: reason.clone(),
                 });
@@ -918,6 +921,7 @@ impl Kernel {
                 attempted: false,
                 succeeded: false,
                 verified: false,
+                verification_indeterminate: false,
                 checks: Vec::new(),
                 detail: "compensation unavailable".to_string(),
             });
@@ -936,15 +940,15 @@ impl Kernel {
             .into_iter()
             .map(|invariant| invariant.check(InvariantPhase::AfterRollback, ctx))
             .collect();
-        if let Ok(checks) = precheck {
-            if checks.iter().all(|check| check.passed)
-                && invariants.iter().all(|check| check.passed)
-            {
+        let invariants_ok = invariants.iter().all(|check| check.passed);
+        match precheck {
+            Ok(checks) if checks.iter().all(|check| check.passed) && invariants_ok => {
                 record.invariants_after_rollback = invariants;
                 record.rollback = Some(RollbackRecord {
                     attempted: false,
                     succeeded: true,
                     verified: true,
+                    verification_indeterminate: false,
                     checks,
                     detail: "rollback was already complete when recovery resumed".to_string(),
                 });
@@ -956,6 +960,29 @@ impl Kernel {
                     None,
                 );
             }
+            Err(error) if invariants_ok => {
+                let detail = error.to_string();
+                record.invariants_after_rollback = invariants;
+                record.rollback = Some(RollbackRecord {
+                    attempted: false,
+                    succeeded: false,
+                    verified: false,
+                    verification_indeterminate: true,
+                    checks: Vec::new(),
+                    detail: detail.clone(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::RollbackVerificationIndeterminate,
+                    message: detail,
+                });
+                return self.persist_checkpoint(
+                    record,
+                    trace,
+                    ExecutionOutcome::RollbackVerificationRequired,
+                    None,
+                );
+            }
+            Ok(_) | Err(_) => {}
         }
 
         let permit = EffectPermit::new();
@@ -966,6 +993,7 @@ impl Kernel {
                     attempted: true,
                     succeeded: false,
                     verified: false,
+                    verification_indeterminate: false,
                     checks: Vec::new(),
                     detail: error.to_string(),
                 });
@@ -986,6 +1014,7 @@ impl Kernel {
                     attempted: true,
                     succeeded: false,
                     verified: false,
+                    verification_indeterminate: false,
                     checks: Vec::new(),
                     detail: reason.clone(),
                 });
@@ -1031,6 +1060,7 @@ impl Kernel {
                     attempted,
                     succeeded: true,
                     verified: true,
+                    verification_indeterminate: false,
                     checks,
                     detail: "rollback verified".to_string(),
                 });
@@ -1064,6 +1094,7 @@ impl Kernel {
                     attempted,
                     succeeded: true,
                     verified: false,
+                    verification_indeterminate: false,
                     checks,
                     detail: detail.clone(),
                 });
@@ -1079,17 +1110,52 @@ impl Kernel {
                     None,
                 )
             }
-            Err(error) => {
+            Err(error) if invariants_ok => {
+                let detail = error.to_string();
                 record.rollback = Some(RollbackRecord {
                     attempted,
                     succeeded: true,
                     verified: false,
+                    verification_indeterminate: true,
                     checks: Vec::new(),
-                    detail: error.to_string(),
+                    detail: detail.clone(),
+                });
+                record.failure = Some(FailureRecord {
+                    class: FailureClass::RollbackVerificationIndeterminate,
+                    message: detail,
+                });
+                self.persist_checkpoint(
+                    record,
+                    trace,
+                    ExecutionOutcome::RollbackVerificationRequired,
+                    None,
+                )
+            }
+            Err(_) => {
+                let detail = record
+                    .invariants_after_rollback
+                    .iter()
+                    .find(|check| !check.passed)
+                    .map_or_else(
+                        || "rollback verification failed".to_string(),
+                        |check| {
+                            format!(
+                                "rollback invariant failed: {}: {}",
+                                check.name, check.reason
+                            )
+                        },
+                    );
+                record.rollback = Some(RollbackRecord {
+                    attempted,
+                    succeeded: true,
+                    verified: false,
+                    verification_indeterminate: false,
+                    checks: Vec::new(),
+                    detail: detail.clone(),
                 });
                 record.failure = Some(FailureRecord {
                     class: FailureClass::RollbackFailed,
-                    message: error.to_string(),
+                    message: detail,
                 });
                 self.finish_terminal(
                     record,
@@ -1132,7 +1198,7 @@ impl Kernel {
         started_at_ms: u64,
     ) -> ExecutionRecord {
         ExecutionRecord {
-            schema_version: 3,
+            schema_version: 4,
             execution_id,
             action_id: action.action_id(),
             action_type: action.action_type().to_string(),

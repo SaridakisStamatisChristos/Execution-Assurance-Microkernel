@@ -76,6 +76,11 @@ pub struct RollbackRecord {
     pub attempted: bool,
     pub succeeded: bool,
     pub verified: bool,
+    /// `true` means the rollback observation path could not establish whether
+    /// compensation is complete. The kernel must not repeat compensation only
+    /// because this observer is unavailable.
+    #[serde(default)]
+    pub verification_indeterminate: bool,
     pub checks: Vec<CheckRecord>,
     pub detail: String,
 }
@@ -102,6 +107,7 @@ pub enum ExecutionOutcome {
     CommitFailed,
     ReconciliationRequired,
     VerificationRequired,
+    RollbackVerificationRequired,
     RolledBack,
     RollbackFailed,
 }

@@ -65,6 +65,8 @@ pub struct TestAction {
     pub verify_error: bool,
     pub rollback_ok: bool,
     pub rollback_conflict: bool,
+    pub rollback_verify_ok: bool,
+    pub rollback_verify_error: bool,
     pub partial_rollback: bool,
     pub compensable: bool,
     pub commit_behavior: CommitBehavior,
@@ -79,6 +81,8 @@ impl Default for TestAction {
             verify_error: false,
             rollback_ok: true,
             rollback_conflict: false,
+            rollback_verify_ok: true,
+            rollback_verify_error: false,
             partial_rollback: false,
             compensable: true,
             commit_behavior: CommitBehavior::Confirmed,
@@ -217,7 +221,10 @@ impl Action for TestAction {
         ctx: &World,
         snapshot: &Self::Snapshot,
     ) -> Result<Vec<CheckRecord>, Self::Error> {
-        Ok(vec![if ctx.value == *snapshot {
+        if self.rollback_verify_error {
+            return Err(TestError("rollback verification observer unavailable"));
+        }
+        Ok(vec![if self.rollback_verify_ok && ctx.value == *snapshot {
             CheckRecord::pass("rollback_value", ctx.value.to_string())
         } else {
             CheckRecord::fail("rollback_value", "snapshot not restored")

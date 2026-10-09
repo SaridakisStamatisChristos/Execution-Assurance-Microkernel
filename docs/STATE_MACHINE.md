@@ -30,7 +30,13 @@ Committed ---- recovery/readback ----> ReconciliationRequired ----> Committed
   +---- compensable explicit verification/invariant failure -> RollbackPending
   |                                                              |       \
   |                                                              |        +--> Failed
-  |                                                              |             (failure/conflict)
+  |                                                              |             (failure/conflict/
+  |                                                              |              explicit rollback
+  |                                                              |              verification failure)
+  |                                                              |
+  |                                                              +---- rollback observer unavailable
+  |                                                              |     --> [remain RollbackPending]
+  |                                                              |         outcome=RollbackVerificationRequired
   |                                                              v
   |                                                          RolledBack
   v
@@ -43,6 +49,8 @@ Finalized
 `ReconciliationRequired` is deliberately nonterminal. It represents an execution whose external effect cannot yet be classified safely.
 
 Verification uncertainty is also nonterminal, but it does not need a new durable state. If `Action::verify` returns an observer error, the journal stays at `Committed`, evidence records `ExecutionOutcome::VerificationRequired`, and compensation is not started. Recovery re-establishes the output and attempts verification again without repeating `commit`.
+
+Rollback-verification uncertainty follows the same epistemic rule. If `Action::verify_rollback` returns an observer error while post-rollback invariants do not explicitly fail, the journal stays at `RollbackPending`, evidence records `ExecutionOutcome::RollbackVerificationRequired`, and compensation is not repeated solely because the observer is unavailable.
 
 ## Normal path
 
@@ -76,6 +84,16 @@ RollbackStatus::Conflict { reason }
 
 `Succeeded` still requires independent rollback verification and post-rollback invariants before `RolledBack` is legal. `Failed` and `Conflict` both terminate as `Failed`/`RollbackFailed`, but evidence distinguishes mechanical rollback failure from deliberate refusal caused by ownership loss.
 
+Rollback verification is itself tri-state in meaning:
+
+```text
+Ok(all checks pass) -> RollbackPending -> RolledBack
+Ok(any check fails) -> explicit negative rollback observation
+Err(observer error) -> keep RollbackPending -> RollbackVerificationRequired checkpoint
+```
+
+On recovery from `RollbackPending`, the kernel always verifies first. A passing observation finalizes without another rollback. An observer error remains pending and does not invoke `rollback_status`. Only an explicit negative observation or failed rollback invariant permits the normal compensation retry/conflict path.
+
 The reference SQLite action enforces ownership in an atomic conditional update. The reference file action compares current content before restoring its snapshot; it detects ordinary interference but does not claim distributed filesystem fencing.
 
 ## Durable recovery interpretation
@@ -86,11 +104,13 @@ The reference SQLite action enforces ownership in an atomic conditional update. 
 | `Prepared` | `ReconcileBeforeRetry` | use action readback; never blind retry |
 | `ReconciliationRequired` | `ReconcileBeforeRetry` | retry reconciliation only, not commit |
 | `Committed` | `VerifyOrRollback` | re-establish output through reconciliation, then verify; rollback only after explicit failed verification/invariant |
-| `RollbackPending` | `CompleteRollback` | first verify whether compensation already completed; otherwise resume it |
+| `RollbackPending` | `CompleteRollback` | verify first; finalize if complete; stay pending if observer unavailable; retry compensation only after explicit negative evidence |
 | `Verified` | `FinalizeVerified` | persist/finalize without repeating the effect |
 | `Finalized`, `Rejected`, `Aborted`, `RolledBack`, `Failed` | `None` | settled |
 
 A prior `VerificationRequired` result has last durable state `Committed`, so restart recovery follows the `VerifyOrRollback` plan. If verification is again indeterminate, the durable head remains `Committed`.
+
+A prior `RollbackVerificationRequired` result has last durable state `RollbackPending`, so restart recovery follows `CompleteRollback`. If rollback verification is again indeterminate, the durable head remains `RollbackPending` and rollback count does not increase.
 
 ## Durable JSONL framing
 

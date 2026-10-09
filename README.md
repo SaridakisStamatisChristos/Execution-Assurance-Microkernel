@@ -12,7 +12,7 @@
 [![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success.svg)](Cargo.toml)
 [![Status](https://img.shields.io/badge/status-reference%20implementation-informational.svg)](#scope-and-non-goals)
 
-[Why it exists](#why-it-exists) · [Architecture](#architecture) · [Guarantees](#kernel-invariants-k1k10) · [Quick start](#quick-start) · [Recovery](#crash-recovery) · [Benchmarks](#benchmarks) · [License](#license)
+[Why it exists](#why-it-exists) · [Architecture](#architecture) · [Guarantees](#kernel-invariants-k1k11) · [Quick start](#quick-start) · [Recovery](#crash-recovery) · [Benchmarks](#benchmarks) · [License](#license)
 
 </div>
 
@@ -27,6 +27,7 @@ Software routinely treats a successful function return, database call, or HTTP r
 - a commit may return successfully while the intended postcondition is absent;
 - a verifier may itself be unavailable, making the result **unknown rather than false**;
 - rollback may fail, partially restore state, or become unsafe after another actor changes the world;
+- rollback verification may itself be unavailable, making compensation **unverified rather than failed**;
 - an interrupted local append may leave a torn final persistence frame;
 - retry after an unknown outcome may duplicate a real-world effect.
 
@@ -36,11 +37,14 @@ Execution Assurance Microkernel isolates that problem into one small lifecycle:
 PROPOSE -> VALIDATE -> PREPARE -> COMMIT -> VERIFY -> RECORD
                                       |         |
                                       |         +-- explicit failure --> ROLLBACK -> VERIFY ROLLBACK
+                                      |         |                                |
+                                      |         |                                +-- observer error --> VERIFY ROLLBACK LATER
+                                      |         |                                                     (no repeat rollback)
                                       |         +-- observer error ----> VERIFY LATER (no rollback)
                                       +-- unknown --> RECONCILE (never blind retry)
 ```
 
-The kernel does **not** decide what action should be taken. Application code proposes the action. The kernel owns the execution boundary: whether the effect may occur, whether it can be established, whether the intended result is actually observed, how interrupted execution is recovered, and what evidence remains afterward.
+The kernel does **not** decide what action should be taken. Application code proposes the action. The kernel owns the execution boundary: whether the effect may occur, whether it can be established, whether the intended result is actually observed, how interrupted execution is recovered, whether compensation may safely be repeated, and what evidence remains afterward.
 
 ## At a glance
 
@@ -53,6 +57,7 @@ The kernel does **not** decide what action should be taken. Application code pro
 | Unknown commit | reconciliation; never blind retry |
 | Unknown verification | `VerificationRequired`; never automatic rollback |
 | Rollback | snapshot-based, independently verified |
+| Unknown rollback verification | `RollbackVerificationRequired`; never repeat compensation solely because the observer is unavailable |
 | Compensation conflict | explicit `RollbackStatus::Conflict` |
 | Crash recovery | fsync-backed journal + recovery envelope |
 | Torn JSONL tail | repaired on reopen; committed corruption fails closed |
@@ -83,6 +88,8 @@ flowchart LR
         VE -->|Explicit failure| RB[Rollback]
         VE -->|Observer unavailable| VR[VerificationRequired]
         RB --> RV[Verify rollback]
+        RV -->|Observer unavailable| RVR[RollbackVerificationRequired]
+        RVR --> RV
     end
 
     K --> KERNEL
@@ -93,6 +100,7 @@ flowchart LR
     RE --> EXT
     VE --> EXT
     RB --> EXT
+    RV --> EXT
 ```
 
 `commit`, `rollback`, and `reconcile` require an `EffectPermit`. Downstream `Action` implementations can name that type but safe downstream code cannot construct it, so the normal effect boundary is enforced structurally rather than by convention.
@@ -116,14 +124,15 @@ stateDiagram-v2
     Committed --> Committed: verifier unavailable / recover later
     Committed --> RollbackPending: explicit verification / invariant failure
     Committed --> Failed: non-compensable failure
+    RollbackPending --> RollbackPending: rollback verifier unavailable / recover later
     RollbackPending --> RolledBack: compensation verified
-    RollbackPending --> Failed: compensation failure / conflict / verification failure
+    RollbackPending --> Failed: compensation failure / conflict / explicit rollback verification failure
     Verified --> Finalized
 ```
 
-`ReconciliationRequired` is deliberately nonterminal. Verification uncertainty is represented by a nonterminal evidence checkpoint while the durable head remains `Committed`.
+`ReconciliationRequired` is deliberately nonterminal. Verification uncertainty is represented by a nonterminal evidence checkpoint while the durable head remains `Committed`. Rollback-verification uncertainty is represented by a nonterminal checkpoint while the durable head remains `RollbackPending`.
 
-## Kernel invariants K1–K10
+## Kernel invariants K1–K11
 
 The project treats these as executable design constraints rather than documentation-only aspirations.
 
@@ -139,10 +148,13 @@ The project treats these as executable design constraints rather than documentat
 | **K8** | `verification_indeterminate -> no rollback` | observer failure is uncertainty, not proof of a bad postcondition |
 | **K9** | `torn_tail -> prior_frames_readable` | an interrupted final append cannot invalidate earlier committed history |
 | **K10** | `ownership_lost -> compensation_conflict` | detectable interference is exposed instead of silently overwritten |
+| **K11** | `rollback_verification_indeterminate -> no repeated rollback` | an unavailable rollback observer is not evidence that compensation must run again |
 
 Duplicate **execution IDs** additionally fail closed before lifecycle execution begins.
 
 K10 is action-specific rather than a claim of distributed fencing. The SQLite reference action has an atomic compare-condition in its rollback update. The file reference action compares current content before restoration, which catches ordinary interference but cannot turn a general filesystem into a compare-and-swap service.
+
+K11 is deliberately epistemic. After compensation has been attempted, `verify_rollback()` returning an observer error leaves the durable head at `RollbackPending` and produces `RollbackVerificationRequired`. Recovery verifies first and does not call rollback again merely because observation remains unavailable.
 
 ## Core API
 
@@ -218,7 +230,7 @@ Ok(any check fails)  -> explicit verification failure
 Err(observer error)  -> VerificationRequired
 ```
 
-An observer error is not evidence that the postcondition is false. The kernel records schema-version-3 evidence with `VerificationRecord.indeterminate = true`, keeps the durable head at `Committed`, returns `ExecutionOutcome::VerificationRequired`, and performs **no compensation**.
+An observer error is not evidence that the postcondition is false. The kernel records evidence with `VerificationRecord.indeterminate = true`, keeps the durable head at `Committed`, returns `ExecutionOutcome::VerificationRequired`, and performs **no compensation**.
 
 A later `recover(...)` re-establishes/readbacks the committed output and verifies again without repeating `commit`. Repeated observer failure remains recoverable. If a later observation explicitly disproves the postcondition, normal compensation policy applies.
 
@@ -235,6 +247,20 @@ RollbackStatus::Conflict { reason }
 Existing actions remain source-compatible through a default mapping from the original `rollback()` hook. Conflict-aware actions can override `rollback_status()` to refuse restoration when current state is no longer attributable to the execution being compensated.
 
 `Succeeded` is still not enough: rollback postconditions and post-rollback invariants must independently pass before the outcome can be `RolledBack`.
+
+### Rollback verification is also tri-state in meaning
+
+`Action::verify_rollback()` is interpreted as:
+
+```text
+Ok(all checks pass)  -> RolledBack
+Ok(any check fails)  -> explicit negative rollback observation
+Err(observer error)  -> RollbackVerificationRequired
+```
+
+If the rollback observer fails while post-rollback invariants do not independently fail, the kernel records `FailureClass::RollbackVerificationIndeterminate`, marks `RollbackRecord.verification_indeterminate = true`, keeps the durable head at `RollbackPending`, and returns `ExecutionOutcome::RollbackVerificationRequired`.
+
+Recovery is **verify-before-act**. It retries rollback observation first. A passing observation finalizes `RolledBack` with no new compensation. Another observer error stays recoverable and does not increment rollback count. Only explicit negative rollback evidence can enter the normal compensation retry/conflict path.
 
 ## Unknown commit outcomes and reconciliation
 
@@ -283,6 +309,20 @@ fsync
 
 A crash after the effect but before the `Committed` marker leaves durable `Prepared`, so recovery reconciles rather than recommitting.
 
+Compensation has its own recoverable boundary:
+
+```text
+WRITE ROLLBACK_PENDING
+fsync
+
+ATTEMPT COMPENSATION
+
+VERIFY ROLLBACK
+  pass            -> RolledBack
+  explicit fail   -> failure / retry / conflict semantics
+  observer error  -> remain RollbackPending
+```
+
 ### Recovery table
 
 | Last durable state | Recovery action |
@@ -291,11 +331,11 @@ A crash after the effect but before the `Committed` marker leaves durable `Prepa
 | `Prepared` | reconcile before any retry decision |
 | `ReconciliationRequired` | reconcile again; never recommit |
 | `Committed` | re-establish/read back output, then verify; compensate only after explicit failure |
-| `RollbackPending` | verify whether compensation already completed; resume only if needed |
+| `RollbackPending` | verify rollback first; finalize if complete; remain pending if observer unavailable; retry compensation only after explicit negative evidence |
 | `Verified` | finalize without repeating the effect |
 | terminal state | no recovery action |
 
-A prior `VerificationRequired` outcome maps naturally to the `Committed` recovery path.
+A prior `VerificationRequired` outcome maps naturally to the `Committed` recovery path. A prior `RollbackVerificationRequired` outcome maps naturally to the `RollbackPending` recovery path.
 
 ### Torn-tail-safe local logs
 
@@ -326,7 +366,7 @@ This is a **local execution guarantee**, not a distributed exactly-once protocol
 
 Every execution emits a machine-inspectable `ExecutionRecord` containing identity, timestamps, transitions, validation, preconditions, invariants, commit disposition, reconciliation, verification, rollback, recovery metadata, typed failure, outcome, and a SHA-256 record seal.
 
-Schema version 3 adds explicit verification indeterminacy so evidence can distinguish "observed false" from "could not observe."
+Schema version 4 records both ordinary verification indeterminacy and rollback-verification indeterminacy. `RollbackRecord.verification_indeterminate` is serde-defaulted so earlier records lacking the field remain decodable by the current shape.
 
 ### Terminal-state ordering
 
@@ -351,9 +391,9 @@ Recovery snapshots live in the journal rather than the evidence record and may c
 
 ## Failure taxonomy
 
-The implementation distinguishes materially different failure semantics: validation, precondition, snapshot, known/unknown commit, explicit/indeterminate verification, invariant, rollback failure, compensation unavailable, compensation conflict, reconciliation, recovery, evidence persistence, journal, execution identity, idempotency, and injected faults.
+The implementation distinguishes materially different failure semantics: validation, precondition, snapshot, known/unknown commit, explicit/indeterminate verification, invariant, rollback failure, indeterminate rollback verification, compensation unavailable, compensation conflict, reconciliation, recovery, evidence persistence, journal, execution identity, idempotency, and injected faults.
 
-That distinction matters because safe recovery depends on knowing **where uncertainty begins and whether state ownership still exists**.
+That distinction matters because safe recovery depends on knowing **where uncertainty begins, what was actually observed, and whether state ownership still exists**.
 
 ## Fault injection and adversarial testing
 
@@ -367,7 +407,7 @@ The deterministic injector exposes all eight lifecycle boundaries:
 | `DuringCommit` | prepared; effect uncertain; reconcile |
 | `AfterCommit` | prepared; effect may exist; reconcile |
 | `BeforeVerify` | committed; recover and verify |
-| `DuringRollback` | rollback pending; resume/verify compensation |
+| `DuringRollback` | rollback pending; verify-before-resume compensation |
 | `AfterRollback` | rollback pending; verify whether rollback already completed |
 
 Hardening regressions additionally cover:
@@ -376,6 +416,10 @@ Hardening regressions additionally cover:
 - repeated verifier unavailability across recovery;
 - later verification success without a second commit;
 - later explicit failed verification followed by compensation;
+- rollback verifier unavailable after successful compensation;
+- repeated rollback-verifier unavailability without a second compensation;
+- later rollback verification finalizing without another compensation;
+- explicit negative rollback observation entering the normal compensation retry path;
 - torn final journal and evidence records;
 - committed malformed JSON failing closed;
 - appending after torn-tail repair;
@@ -405,7 +449,7 @@ The goal is depth of semantics, not integration count.
 cargo bench --locked --bench kernel
 ```
 
-Reference run: GitHub Actions `ubuntu-24.04`, Rust stable 1.99.0, 2026-10-08.
+Historical reference run: GitHub Actions `ubuntu-24.04`, Rust stable 1.99.0, 2026-10-08.
 
 | Path | Samples | Median | p95 |
 |---|---:|---:|---:|
@@ -415,9 +459,9 @@ Reference run: GitHub Actions `ubuntu-24.04`, Rust stable 1.99.0, 2026-10-08.
 
 Criterion from the same run reported approximately `7.23–7.32 µs`, `9.45–9.65 µs`, and `2.29–2.42 ms` respectively.
 
-[View the benchmark/validation run](https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel/actions/runs/37857640762)
+[View the historical benchmark/validation run](https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel/actions/runs/37857640762)
 
-These are environment-specific observations, **not universal latency guarantees**.
+These are environment-specific historical observations, **not universal latency guarantees or exact-current-head performance evidence**. Rerun the benchmark on the current candidate before making current-head performance claims.
 
 ## Quality gates
 
@@ -458,6 +502,7 @@ The workflow has read-only repository permissions.
 ├── tests/
 │   ├── lifecycle.rs
 │   ├── verification_uncertainty.rs
+│   ├── rollback_verification_uncertainty.rs
 │   ├── fault_injection.rs
 │   ├── recovery.rs
 │   ├── idempotency.rs
@@ -477,8 +522,8 @@ The workflow has read-only repository permissions.
 
 ## Documentation
 
-- [`docs/SPEC.md`](docs/SPEC.md) — formal execution contract and K1–K10 semantics.
-- [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) — legal transitions, verification uncertainty, and durable recovery interpretation.
+- [`docs/SPEC.md`](docs/SPEC.md) — formal execution contract and K1–K11 semantics.
+- [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) — legal transitions, verification uncertainty, rollback-verification uncertainty, and durable recovery interpretation.
 - [`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md) — uncertainty, compensation conflict, persistence corruption, and fault semantics.
 
 ## Scope and non-goals
