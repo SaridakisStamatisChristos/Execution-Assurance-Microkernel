@@ -55,11 +55,6 @@ impl AtomicReplace {
         fs::rename(tmp, path)
     }
 
-    fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        Self::write_and_rename(path, bytes)?;
-        Self::sync_parent(path)
-    }
-
     fn commit_replace_with<F>(&self, sync_parent: F) -> CommitStatus<String, io::Error>
     where
         F: FnOnce(&Path) -> io::Result<()>,
@@ -76,6 +71,29 @@ impl AtomicReplace {
                     "replacement is visible but parent-directory durability could not be established: {error}"
                 ),
             },
+        }
+    }
+
+    fn reconcile_with<F>(&self, sync_parent: F) -> Result<ReconciliationResult<String>, io::Error>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
+        match fs::read(&self.path) {
+            Ok(bytes) if bytes == self.replacement => match sync_parent(&self.path) {
+                Ok(()) => Ok(ReconciliationResult::Committed(Self::hash(&bytes))),
+                Err(error) => Ok(ReconciliationResult::Unresolved {
+                    reason: format!(
+                        "replacement is visible but parent-directory durability remains unestablished: {error}"
+                    ),
+                }),
+            },
+            Ok(_) => Ok(ReconciliationResult::Unresolved {
+                reason: "target exists with content different from proposed replacement".to_string(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(ReconciliationResult::NotCommitted)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -103,9 +121,9 @@ impl AtomicReplace {
         }
 
         let restored = match snapshot {
-            Some(bytes) => Self::replace(&self.path, bytes),
+            Some(bytes) => Self::write_and_rename(&self.path, bytes),
             None => match fs::remove_file(&self.path) {
-                Ok(()) => Self::sync_parent(&self.path),
+                Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             },
@@ -114,6 +132,37 @@ impl AtomicReplace {
             Ok(()) => RollbackStatus::Succeeded,
             Err(error) => RollbackStatus::Failed(error),
         }
+    }
+
+    fn verify_rollback_with<F>(
+        &self,
+        snapshot: &Option<Vec<u8>>,
+        sync_parent: F,
+    ) -> Result<Vec<CheckRecord>, io::Error>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
+        let passed = match snapshot {
+            Some(bytes) => match fs::read(&self.path) {
+                Ok(current) => current == *bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error),
+            },
+            None => !self.path.exists(),
+        };
+
+        if !passed {
+            return Ok(vec![CheckRecord::fail(
+                "rollback_state",
+                "pre-execution file state not restored",
+            )]);
+        }
+
+        sync_parent(&self.path)?;
+        Ok(vec![CheckRecord::pass(
+            "rollback_state",
+            "pre-execution file state restored and parent-directory durability established",
+        )])
     }
 }
 
@@ -166,19 +215,7 @@ impl Action for AtomicReplace {
         _permit: &EffectPermit,
         _ctx: &mut (),
     ) -> Result<ReconciliationResult<Self::Output>, Self::Error> {
-        match fs::read(&self.path) {
-            Ok(bytes) if bytes == self.replacement => {
-                Ok(ReconciliationResult::Committed(Self::hash(&bytes)))
-            }
-            Ok(_) => Ok(ReconciliationResult::Unresolved {
-                reason: "target exists with content different from proposed replacement"
-                    .to_string(),
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok(ReconciliationResult::NotCommitted)
-            }
-            Err(error) => Err(error),
-        }
+        self.reconcile_with(Self::sync_parent)
     }
 
     fn verify(&self, _ctx: &(), output: &Self::Output) -> Result<Vec<CheckRecord>, Self::Error> {
@@ -218,15 +255,7 @@ impl Action for AtomicReplace {
         _ctx: &(),
         snapshot: &Self::Snapshot,
     ) -> Result<Vec<CheckRecord>, Self::Error> {
-        let passed = match snapshot {
-            Some(bytes) => fs::read(&self.path)? == *bytes,
-            None => !self.path.exists(),
-        };
-        Ok(vec![if passed {
-            CheckRecord::pass("rollback_state", "pre-execution file state restored")
-        } else {
-            CheckRecord::fail("rollback_state", "pre-execution file state not restored")
-        }])
+        self.verify_rollback_with(snapshot, Self::sync_parent)
     }
 }
 
@@ -326,6 +355,61 @@ mod tests {
         let status = action.commit_replace_with(|_| Err(io::Error::other("sync failed")));
         assert!(matches!(status, CommitStatus::Unknown { .. }));
         assert_eq!(fs::read(&path).unwrap(), b"ours");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_does_not_confirm_commit_until_parent_durability_is_established() {
+        let root = std::env::temp_dir().join(format!("eamk-file-reconcile-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"before").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+
+        let status = action.commit_replace_with(|_| Err(io::Error::other("sync failed")));
+        assert!(matches!(status, CommitStatus::Unknown { .. }));
+
+        let unresolved = action
+            .reconcile_with(|_| Err(io::Error::other("sync still failed")))
+            .unwrap();
+        assert!(matches!(
+            unresolved,
+            ReconciliationResult::Unresolved { .. }
+        ));
+
+        let resolved = action.reconcile_with(|_| Ok(())).unwrap();
+        assert!(matches!(resolved, ReconciliationResult::Committed(_)));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollback_durability_uncertainty_is_left_for_verified_recovery() {
+        let root = std::env::temp_dir().join(format!("eamk-file-rollback-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"ours").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+        let snapshot = Some(b"before".to_vec());
+
+        let status = action.rollback_if_owned(&snapshot);
+        assert!(matches!(status, RollbackStatus::Succeeded));
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+
+        let error = action
+            .verify_rollback_with(&snapshot, |_| Err(io::Error::other("sync failed")))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        let checks = action.verify_rollback_with(&snapshot, |_| Ok(())).unwrap();
+        assert!(checks.iter().all(|check| check.passed));
 
         fs::remove_dir_all(root).unwrap();
     }

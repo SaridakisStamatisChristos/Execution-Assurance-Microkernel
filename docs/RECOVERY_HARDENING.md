@@ -1,10 +1,10 @@
 # Recovery Trust and Local Durability Hardening
 
-This note documents the residual hardening applied after the K1-K11 execution-semantics work. It narrows three failure surfaces without changing the kernel's declared scope or introducing distributed coordination.
+This note documents the residual hardening applied after the K1-K11 execution-semantics work. It narrows local recovery, evidence-trust, and filesystem-durability failure surfaces without changing the kernel's declared scope or introducing distributed coordination.
 
 ## 1. Process-local recovery ownership
 
-`Kernel::recover(execution_id, ...)` now acquires a process-local guard for the execution ID before reading evidence, reading the journal, or invoking any action recovery hook.
+`Kernel::recover(execution_id, ...)` acquires a process-local guard for the execution ID before reading evidence, reading the journal, or invoking any action recovery hook.
 
 If another recovery for the same execution ID is already active in the same process, the contender fails closed with:
 
@@ -18,7 +18,7 @@ This is intentionally **not** a distributed lease or fencing protocol. Multiple 
 
 ## 2. Evidence integrity before recovery trust
 
-Recovery no longer treats a located evidence record as authoritative solely because it exists.
+Recovery does not treat a located evidence record as authoritative solely because it exists.
 
 Before terminal evidence can cause `AlreadyFinalized`, or before a nonterminal checkpoint can inform recovery, the kernel verifies the record's SHA-256 seal with `ExecutionRecord::verify_hash()`.
 
@@ -36,29 +36,58 @@ Hash verification is schema-aware so a legitimate older sealed record is checked
 
 ## 3. Atomic-file namespace durability
 
-The atomic-file reference action already fsynced temporary file contents before rename. On Unix it now also fsyncs the parent directory after a successful rename so the namespace change is made durable before commit confirmation.
-
-Rollback that removes a file likewise fsyncs the parent directory after successful removal.
+The atomic-file reference action fsyncs temporary file contents before rename and, on Unix, requires a parent-directory `sync_all()` before a newly written namespace entry may be considered durably committed.
 
 The parent-directory sync is deliberately platform-scoped:
 
-- Unix: parent directory opened and `sync_all()` invoked;
+- Unix: the parent directory is opened and `sync_all()` is invoked;
 - non-Unix: no equivalent portable directory-fsync guarantee is claimed by this reference action.
 
-### Post-rename sync failure is uncertainty
+### Post-rename sync failure remains commit uncertainty
 
-A parent-directory sync can fail **after** the rename has already made the replacement visible. The commit path therefore does not misclassify that condition as a known failed commit.
-
-Instead:
+A parent-directory sync can fail **after** rename has already made the replacement visible. The commit path therefore does not misclassify that condition as a known failed commit:
 
 ```text
 rename succeeds
 parent-directory sync fails
 => CommitStatus::Unknown
-=> reconciliation/readback before any retry decision
+=> reconciliation before any success claim or retry decision
 ```
 
-This preserves the kernel's central uncertainty rule: an error reported after an externally visible effect is not proof that the effect did not happen.
+Reconciliation now closes the remaining ambiguity instead of trusting visibility alone. If the expected replacement is visible, reconciliation attempts the parent-directory sync again. Only a successful durability sync permits `ReconciliationResult::Committed`; another sync failure returns `ReconciliationResult::Unresolved`.
+
+```text
+expected bytes visible
+AND parent-directory sync succeeds
+=> ReconciliationResult::Committed
+
+expected bytes visible
+AND parent-directory sync still fails
+=> ReconciliationResult::Unresolved
+```
+
+This prevents a visible-but-not-yet-durable directory entry from being promoted to an established commit merely because readback succeeded.
+
+### Rollback durability is verified, not assumed
+
+Compensation separates the namespace mutation from the durability proof:
+
+1. `rollback_status` restores or removes the target namespace entry;
+2. `verify_rollback` independently verifies the restored state;
+3. when the rollback state matches the snapshot, `verify_rollback` fsyncs the parent directory before reporting a passing rollback check.
+
+Therefore a parent-directory sync failure after a visible rollback does **not** become immediate terminal rollback failure. It surfaces through the existing rollback-verification uncertainty path:
+
+```text
+rollback mutation visible
+parent-directory durability check fails
+=> verify_rollback returns observer/durability error
+=> RollbackVerificationRequired
+=> durable head remains RollbackPending
+=> recovery verifies again before considering another compensation attempt
+```
+
+A later successful rollback verification both observes the expected snapshot and establishes parent-directory durability before the execution can finalize as rolled back.
 
 ## 4. Regression coverage
 
@@ -73,8 +102,12 @@ The atomic-file example additionally tests:
 
 - conflict-aware compensation preserves unrelated external content;
 - owned content can be restored;
-- removal compensation completes correctly;
-- failure of parent-directory sync after rename is classified as `CommitStatus::Unknown`, while the already-visible replacement remains detectable by reconciliation.
+- removal compensation mutates the namespace correctly;
+- failure of parent-directory sync after rename is classified as `CommitStatus::Unknown`;
+- visible replacement bytes do not reconcile to `Committed` while parent-directory durability remains unestablished;
+- reconciliation can later establish the commit after a successful durability sync;
+- rollback-state visibility plus failed parent-directory sync remains verification uncertainty;
+- a later successful rollback durability verification passes without repeating the namespace mutation.
 
 ## 5. Scope boundary
 
