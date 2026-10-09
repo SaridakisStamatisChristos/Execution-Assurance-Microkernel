@@ -104,12 +104,7 @@ fn concurrent_recovery_for_same_execution_fails_closed_in_process() {
     let journal = Arc::new(InMemoryJournal::default());
     let evidence = Arc::new(BlockingEvidenceStore::default());
     let ids = Arc::new(InMemoryIdempotencyStore::default());
-    let kernel = kernel_with(
-        journal,
-        evidence.clone(),
-        ids,
-        Arc::new(NoFaultInjector),
-    );
+    let kernel = kernel_with(journal, evidence.clone(), ids, Arc::new(NoFaultInjector));
     let action = TestAction {
         verify_error: true,
         ..TestAction::default()
@@ -133,11 +128,7 @@ fn concurrent_recovery_for_same_execution_fails_closed_in_process() {
             commits: 1,
             rollbacks: 0,
         };
-        let result = first_kernel.recover(
-            "serialized-recovery",
-            first_action,
-            &mut first_world,
-        );
+        let result = first_kernel.recover("serialized-recovery", first_action, &mut first_world);
         (result, first_world)
     });
 

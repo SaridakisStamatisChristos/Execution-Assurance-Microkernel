@@ -93,9 +93,7 @@ impl LocalRecoveryGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !active.insert(execution_id.to_string()) {
-            return Err(ExecutionError::RecoveryInProgress(
-                execution_id.to_string(),
-            ));
+            return Err(ExecutionError::RecoveryInProgress(execution_id.to_string()));
         }
         Ok(Self {
             execution_id: execution_id.to_string(),

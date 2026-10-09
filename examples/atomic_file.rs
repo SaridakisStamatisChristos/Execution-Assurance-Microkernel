@@ -32,7 +32,10 @@ impl AtomicReplace {
     #[cfg(unix)]
     fn sync_parent(path: &Path) -> io::Result<()> {
         let parent = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target has no parent directory",
+            )
         })?;
         fs::File::open(parent)?.sync_all()
     }
