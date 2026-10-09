@@ -74,10 +74,7 @@ impl AtomicReplace {
         }
     }
 
-    fn reconcile_with<F>(
-        &self,
-        sync_parent: F,
-    ) -> Result<ReconciliationResult<String>, io::Error>
+    fn reconcile_with<F>(&self, sync_parent: F) -> Result<ReconciliationResult<String>, io::Error>
     where
         F: FnOnce(&Path) -> io::Result<()>,
     {
