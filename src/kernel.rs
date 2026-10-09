@@ -1139,7 +1139,10 @@ impl Kernel {
                     .map_or_else(
                         || "rollback verification failed".to_string(),
                         |check| {
-                            format!("rollback invariant failed: {}: {}", check.name, check.reason)
+                            format!(
+                                "rollback invariant failed: {}: {}",
+                                check.name, check.reason
+                            )
                         },
                     );
                 record.rollback = Some(RollbackRecord {
