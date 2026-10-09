@@ -261,9 +261,11 @@ mod tests {
         let status = action.rollback_if_owned(&mut conn, &snapshot);
         assert!(matches!(status, RollbackStatus::Conflict { .. }));
         let row: (i64, i64) = conn
-            .query_row("SELECT balance, version FROM account WHERE id = 1", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(
+                "SELECT balance, version FROM account WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
         assert_eq!(row, (130, 9));
     }
@@ -289,9 +291,11 @@ mod tests {
         let status = action.rollback_if_owned(&mut conn, &snapshot);
         assert!(matches!(status, RollbackStatus::Succeeded));
         let row: (i64, i64) = conn
-            .query_row("SELECT balance, version FROM account WHERE id = 1", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(
+                "SELECT balance, version FROM account WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
         assert_eq!(row, (100, 7));
     }

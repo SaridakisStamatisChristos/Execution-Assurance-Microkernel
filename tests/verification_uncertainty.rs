@@ -34,12 +34,7 @@ fn verification_can_recover_later_without_a_second_commit() {
     let journal = Arc::new(InMemoryJournal::default());
     let evidence = Arc::new(InMemoryEvidenceStore::default());
     let ids = Arc::new(InMemoryIdempotencyStore::default());
-    let kernel = kernel_with(
-        journal,
-        evidence,
-        ids,
-        Arc::new(NoFaultInjector),
-    );
+    let kernel = kernel_with(journal, evidence, ids, Arc::new(NoFaultInjector));
     let mut world = World::default();
 
     let first = kernel
@@ -71,12 +66,7 @@ fn repeated_observer_failure_remains_recoverable_without_effects() {
     let journal = Arc::new(InMemoryJournal::default());
     let evidence = Arc::new(InMemoryEvidenceStore::default());
     let ids = Arc::new(InMemoryIdempotencyStore::default());
-    let kernel = kernel_with(
-        journal,
-        evidence,
-        ids,
-        Arc::new(NoFaultInjector),
-    );
+    let kernel = kernel_with(journal, evidence, ids, Arc::new(NoFaultInjector));
     let mut world = World::default();
     let action = TestAction {
         verify_error: true,
@@ -104,12 +94,7 @@ fn later_explicit_verification_failure_can_compensate() {
     let journal = Arc::new(InMemoryJournal::default());
     let evidence = Arc::new(InMemoryEvidenceStore::default());
     let ids = Arc::new(InMemoryIdempotencyStore::default());
-    let kernel = kernel_with(
-        journal,
-        evidence,
-        ids,
-        Arc::new(NoFaultInjector),
-    );
+    let kernel = kernel_with(journal, evidence, ids, Arc::new(NoFaultInjector));
     let mut world = World::default();
 
     kernel

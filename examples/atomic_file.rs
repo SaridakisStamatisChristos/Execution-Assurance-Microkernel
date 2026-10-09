@@ -48,8 +48,9 @@ impl AtomicReplace {
             Ok(current) if current == self.replacement => {}
             Ok(_) => {
                 return RollbackStatus::Conflict {
-                    reason: "target changed after commit; refusing to overwrite newer external state"
-                        .to_string(),
+                    reason:
+                        "target changed after commit; refusing to overwrite newer external state"
+                            .to_string(),
                 };
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
