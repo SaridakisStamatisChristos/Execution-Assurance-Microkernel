@@ -4,7 +4,7 @@ use execution_assurance_microkernel::{
     Action, CheckRecord, Clock, CommitStatus, CompensationPolicy, EffectPermit, EvidenceStore,
     FaultInjector, IdGenerator, IdempotencyStore, InMemoryEvidenceStore, InMemoryIdempotencyStore,
     InMemoryJournal, Invariant, InvariantPhase, Journal, Kernel, NoFaultInjector, Predicate,
-    ReconciliationResult, SequenceIdGenerator,
+    ReconciliationResult, RollbackStatus, SequenceIdGenerator,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -62,7 +62,9 @@ pub struct TestAction {
     pub delta: i32,
     pub allowed: bool,
     pub verify_ok: bool,
+    pub verify_error: bool,
     pub rollback_ok: bool,
+    pub rollback_conflict: bool,
     pub partial_rollback: bool,
     pub compensable: bool,
     pub commit_behavior: CommitBehavior,
@@ -74,7 +76,9 @@ impl Default for TestAction {
             delta: 1,
             allowed: true,
             verify_ok: true,
+            verify_error: false,
             rollback_ok: true,
+            rollback_conflict: false,
             partial_rollback: false,
             compensable: true,
             commit_behavior: CommitBehavior::Confirmed,
@@ -162,6 +166,9 @@ impl Action for TestAction {
     }
 
     fn verify(&self, ctx: &World, output: &Self::Output) -> Result<Vec<CheckRecord>, Self::Error> {
+        if self.verify_error {
+            return Err(TestError("verification observer unavailable"));
+        }
         Ok(vec![if self.verify_ok && ctx.value == *output {
             CheckRecord::pass("value_persisted", ctx.value.to_string())
         } else {
@@ -185,6 +192,24 @@ impl Action for TestAction {
         }
         ctx.value = *snapshot;
         Ok(())
+    }
+
+    fn rollback_status(
+        &self,
+        permit: &EffectPermit,
+        ctx: &mut World,
+        snapshot: &Self::Snapshot,
+    ) -> RollbackStatus<Self::Error> {
+        if self.rollback_conflict {
+            ctx.rollbacks += 1;
+            return RollbackStatus::Conflict {
+                reason: "simulated ownership loss".to_string(),
+            };
+        }
+        match self.rollback(permit, ctx, snapshot) {
+            Ok(()) => RollbackStatus::Succeeded,
+            Err(error) => RollbackStatus::Failed(error),
+        }
     }
 
     fn verify_rollback(

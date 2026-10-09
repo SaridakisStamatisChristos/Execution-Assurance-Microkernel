@@ -12,7 +12,7 @@
 [![Unsafe](https://img.shields.io/badge/unsafe-forbidden-success.svg)](Cargo.toml)
 [![Status](https://img.shields.io/badge/status-reference%20implementation-informational.svg)](#scope-and-non-goals)
 
-[Why it exists](#why-it-exists) · [Architecture](#architecture) · [Guarantees](#kernel-invariants-k1k7) · [Quick start](#quick-start) · [Recovery](#crash-recovery) · [Benchmarks](#benchmarks) · [License](#license)
+[Why it exists](#why-it-exists) · [Architecture](#architecture) · [Guarantees](#kernel-invariants-k1k10) · [Quick start](#quick-start) · [Recovery](#crash-recovery) · [Benchmarks](#benchmarks) · [License](#license)
 
 </div>
 
@@ -20,24 +20,27 @@
 
 ## Why it exists
 
-Software routinely treats a successful function return, database call, or HTTP response as proof that an operation succeeded. That assumption breaks at exactly the boundaries where reliability matters most:
+Software routinely treats a successful function return, database call, or HTTP response as proof that an operation succeeded. That breaks at exactly the boundaries where reliability matters most:
 
-- the remote side may apply an effect while the response is lost;
-- a local process may crash between the external effect and its own durable bookkeeping;
+- a remote side may apply an effect while the response is lost;
+- a process may crash between the external effect and local bookkeeping;
 - a commit may return successfully while the intended postcondition is absent;
-- rollback may itself fail or only partially restore state;
-- a retry after an unknown outcome may duplicate a real-world effect.
+- a verifier may itself be unavailable, making the result **unknown rather than false**;
+- rollback may fail, partially restore state, or become unsafe after another actor changes the world;
+- an interrupted local append may leave a torn final persistence frame;
+- retry after an unknown outcome may duplicate a real-world effect.
 
-Execution Assurance Microkernel isolates that problem into one small, explicit lifecycle:
+Execution Assurance Microkernel isolates that problem into one small lifecycle:
 
 ```text
 PROPOSE -> VALIDATE -> PREPARE -> COMMIT -> VERIFY -> RECORD
                                       |         |
-                                      |         +-- failure --> ROLLBACK -> VERIFY ROLLBACK
+                                      |         +-- explicit failure --> ROLLBACK -> VERIFY ROLLBACK
+                                      |         +-- observer error ----> VERIFY LATER (no rollback)
                                       +-- unknown --> RECONCILE (never blind retry)
 ```
 
-The kernel does **not** decide what action should be taken. Application code proposes the action. The kernel decides whether it may cross the effect boundary, whether the effect can be established, whether the intended result actually exists, how an interrupted execution should recover, and what evidence remains afterward.
+The kernel does **not** decide what action should be taken. Application code proposes the action. The kernel owns the execution boundary: whether the effect may occur, whether it can be established, whether the intended result is actually observed, how interrupted execution is recovered, and what evidence remains afterward.
 
 ## At a glance
 
@@ -47,14 +50,17 @@ The kernel does **not** decide what action should be taken. Application code pro
 | MSRV | Rust 1.89 |
 | Unsafe Rust | Forbidden at crate level |
 | Core success rule | established commit **and** verified postcondition |
-| Unknown commit result | explicit reconciliation state; no blind retry |
-| Rollback | snapshot-based, separately verified |
+| Unknown commit | reconciliation; never blind retry |
+| Unknown verification | `VerificationRequired`; never automatic rollback |
+| Rollback | snapshot-based, independently verified |
+| Compensation conflict | explicit `RollbackStatus::Conflict` |
 | Crash recovery | fsync-backed journal + recovery envelope |
+| Torn JSONL tail | repaired on reopen; committed corruption fails closed |
 | Execution identity | explicit execution ID + idempotency key |
 | Durable local deduplication | atomic, fsync-backed claim files |
 | Evidence | machine-readable execution record + SHA-256 seal |
 | Secret handling | configurable + label-based diagnostic redaction |
-| Fault testing | all 8 defined injection points + property/model tests |
+| Fault testing | 8 lifecycle injection points + property/model tests |
 | Reference actions | atomic file, SQLite, adversarial remote API |
 | License | Apache-2.0 |
 
@@ -74,7 +80,8 @@ flowchart LR
         RE -->|Committed| VE
         RE -->|Not committed| A[Abort]
         RE -->|Unresolved| U[ReconciliationRequired]
-        VE -->|Failure| RB[Rollback]
+        VE -->|Explicit failure| RB[Rollback]
+        VE -->|Observer unavailable| VR[VerificationRequired]
         RB --> RV[Verify rollback]
     end
 
@@ -88,7 +95,7 @@ flowchart LR
     RB --> EXT
 ```
 
-The effectful hooks `commit`, `rollback`, and `reconcile` require an `EffectPermit`. The type can be named by downstream `Action` implementations, but safe downstream code cannot construct it. The kernel therefore owns the normal effect boundary instead of relying only on convention.
+`commit`, `rollback`, and `reconcile` require an `EffectPermit`. Downstream `Action` implementations can name that type but safe downstream code cannot construct it, so the normal effect boundary is enforced structurally rather than by convention.
 
 ## Execution state machine
 
@@ -96,63 +103,57 @@ The effectful hooks `commit`, `rollback`, and `reconcile` require an `EffectPerm
 stateDiagram-v2
     [*] --> Created
     Created --> Proposed
-
     Proposed --> Validated: validation + preconditions pass
     Proposed --> Rejected: validation / precondition / identity refusal
-
     Validated --> Prepared: snapshot + pre-commit invariants pass
     Validated --> Aborted: snapshot / invariant failure
-
-    Prepared --> Committed: commit confirmed
+    Prepared --> Committed: commit established
     Prepared --> Failed: known commit failure
     Prepared --> ReconciliationRequired: commit outcome unknown
-
     ReconciliationRequired --> Committed: reconciliation proves effect
     ReconciliationRequired --> Aborted: reconciliation proves no effect
-    ReconciliationRequired --> ReconciliationRequired: still unresolved
-
     Committed --> Verified: postconditions pass
-    Committed --> RollbackPending: verification / invariant failure
+    Committed --> Committed: verifier unavailable / recover later
+    Committed --> RollbackPending: explicit verification / invariant failure
     Committed --> Failed: non-compensable failure
-
     RollbackPending --> RolledBack: compensation verified
-    RollbackPending --> Failed: compensation / rollback verification fails
-
+    RollbackPending --> Failed: compensation failure / conflict / verification failure
     Verified --> Finalized
 ```
 
-`ReconciliationRequired` is deliberately nonterminal. It means the kernel refuses to guess whether the effect happened.
+`ReconciliationRequired` is deliberately nonterminal. Verification uncertainty is represented by a nonterminal evidence checkpoint while the durable head remains `Committed`.
 
-## Kernel invariants K1–K7
+## Kernel invariants K1–K10
 
 The project treats these as executable design constraints rather than documentation-only aspirations.
 
 | ID | Invariant | Meaning |
 |---|---|---|
 | **K1** | `commit -> validation_passed` | no unchecked effect crosses the commit boundary |
-| **K2** | `success -> commit_established && postconditions_verified` | a successful call is not enough |
-| **K3** | `verification_failed -> outcome != success` | failed readback can never be reported as success |
-| **K4** | `same_key -> commit_count <= 1` | duplicate idempotency keys do not create a second effect |
-| **K5** | `terminal_state -> evidence_record_exists` | durable terminal state is written only after durable evidence |
+| **K2** | `success -> commit_established && postconditions_verified` | commit alone is not success |
+| **K3** | `verification_failed -> outcome != success` | a negative readback can never report success |
+| **K4** | `same_key -> commit_count <= 1` | duplicate logical requests do not create another local effect |
+| **K5** | `terminal_state -> evidence_record_exists` | durable terminal state follows durable evidence |
 | **K6** | `rollback_success -> rollback_postconditions_verified` | compensation must itself be proven |
-| **K7** | `commit_unknown -> reconciliation_before_retry` | unknown outcomes are never blindly retried |
+| **K7** | `commit_unknown -> reconciliation_before_retry` | unknown commit outcomes are never blindly retried |
+| **K8** | `verification_indeterminate -> no rollback` | observer failure is uncertainty, not proof of a bad postcondition |
+| **K9** | `torn_tail -> prior_frames_readable` | an interrupted final append cannot invalidate earlier committed history |
+| **K10** | `ownership_lost -> compensation_conflict` | detectable interference is exposed instead of silently overwritten |
 
-The implementation adds one further practical rule: duplicate **execution IDs** fail closed before the lifecycle begins.
+Duplicate **execution IDs** additionally fail closed before lifecycle execution begins.
+
+K10 is action-specific rather than a claim of distributed fencing. The SQLite reference action has an atomic compare-condition in its rollback update. The file reference action compares current content before restoration, which catches ordinary interference but cannot turn a general filesystem into a compare-and-swap service.
 
 ## Core API
-
-The public surface is intentionally small.
 
 ```rust
 let result = Kernel::default().execute(action, &mut context)?;
 ```
 
-For stable identity and deduplication:
+For stable execution identity and local deduplication:
 
 ```rust
-use execution_assurance_microkernel::{
-    ExecutionRequest, IdempotencyKey, Kernel,
-};
+use execution_assurance_microkernel::{ExecutionRequest, IdempotencyKey};
 
 let request = ExecutionRequest::new(action)
     .with_execution_id("job-42")
@@ -167,16 +168,11 @@ For restart recovery:
 let result = kernel.recover("job-42", action, &mut context)?;
 ```
 
-Application code implements `Action`; the kernel owns sequencing, durability boundaries, reconciliation, verification, evidence persistence, and terminal-state ordering.
+Application code implements `Action`; the kernel owns sequencing, durability boundaries, reconciliation, verification, compensation semantics, evidence persistence, and terminal-state ordering.
 
 ## Quick start
 
-### Requirements
-
-- Rust **1.89 or newer**
-- Cargo
-
-### Build and validate
+Requirements: Rust **1.89+** and Cargo.
 
 ```bash
 git clone https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel.git
@@ -190,7 +186,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo bench --locked --no-run
 ```
 
-### Run the reference actions
+Reference actions:
 
 ```bash
 cargo run --example atomic_file
@@ -202,7 +198,7 @@ cargo run --example unreliable_api
 
 ### Commit is only an observation
 
-`Action::commit` returns one of three semantic outcomes:
+`Action::commit` returns:
 
 ```text
 Confirmed(output)
@@ -210,32 +206,39 @@ Failed(error)
 Unknown(reason)
 ```
 
-`Confirmed` means the commit boundary reported success. It does **not** automatically mean the execution is successful. The kernel still requires postcondition verification.
+`Confirmed` establishes the commit boundary's report. The kernel still requires an independently verified postcondition before returning `ExecutionOutcome::Success`.
 
-### Verification is independent
+### Verification is tri-state in meaning
 
-Verification should read the world back through a trustworthy observation path when practical:
-
-- read the persisted file and verify its hash;
-- query the database row and verify value/version;
-- fetch the remote resource and compare expected state.
-
-Only an established commit followed by successful verification can produce `ExecutionOutcome::Success`.
-
-### Compensation is explicit
-
-Actions declare either:
+The existing `Result<Vec<CheckRecord>, Error>` contract is interpreted deliberately:
 
 ```text
-Compensable
-NonCompensable
+Ok(all checks pass)  -> VERIFIED
+Ok(any check fails)  -> explicit verification failure
+Err(observer error)  -> VerificationRequired
 ```
 
-A compensable action captures a pre-effect snapshot, performs rollback when needed, and independently verifies that rollback restored the intended state. A non-compensable action is never falsely reported as rolled back.
+An observer error is not evidence that the postcondition is false. The kernel records schema-version-3 evidence with `VerificationRecord.indeterminate = true`, keeps the durable head at `Committed`, returns `ExecutionOutcome::VerificationRequired`, and performs **no compensation**.
 
-## Unknown outcomes and reconciliation
+A later `recover(...)` re-establishes/readbacks the committed output and verifies again without repeating `commit`. Repeated observer failure remains recoverable. If a later observation explicitly disproves the postcondition, normal compensation policy applies.
 
-The most dangerous failure is often not a clear error, but uncertainty:
+### Compensation is explicit and conflict-aware
+
+Actions declare `Compensable` or `NonCompensable` and expose a rollback result:
+
+```text
+RollbackStatus::Succeeded
+RollbackStatus::Failed(error)
+RollbackStatus::Conflict { reason }
+```
+
+Existing actions remain source-compatible through a default mapping from the original `rollback()` hook. Conflict-aware actions can override `rollback_status()` to refuse restoration when current state is no longer attributable to the execution being compensated.
+
+`Succeeded` is still not enough: rollback postconditions and post-rollback invariants must independently pass before the outcome can be `RolledBack`.
+
+## Unknown commit outcomes and reconciliation
+
+The dangerous case is uncertainty:
 
 ```text
 send request
@@ -244,19 +247,19 @@ response disappears
 client sees timeout
 ```
 
-Retrying immediately can duplicate the effect. The kernel instead enters `ReconciliationRequired` and invokes action-specific readback logic.
+The kernel enters `ReconciliationRequired` and uses action-specific readback:
 
 | Reconciliation result | Kernel behavior |
 |---|---|
-| `Committed(output)` | continue to postcondition verification |
+| `Committed(output)` | continue to verification |
 | `NotCommitted` | abort without re-running commit |
 | `Unresolved(reason)` | remain recoverable and fail closed |
 
-The kernel never calls `commit` twice for the same in-flight execution as a response to uncertainty.
+The kernel never blindly calls `commit` again because an outcome is unknown.
 
 ## Crash recovery
 
-The durable uncertainty boundary is intentionally explicit:
+The durable sequence is intentionally explicit:
 
 ```text
 WRITE PREPARED(snapshot + recovery envelope)
@@ -278,7 +281,7 @@ WRITE TERMINAL STATE
 fsync
 ```
 
-A crash after the effect but before the local `Committed` marker therefore leaves the execution at durable `Prepared`. Recovery reconciles the external world instead of guessing or recommitting.
+A crash after the effect but before the `Committed` marker leaves durable `Prepared`, so recovery reconciles rather than recommitting.
 
 ### Recovery table
 
@@ -287,47 +290,47 @@ A crash after the effect but before the local `Committed` marker therefore leave
 | `Created` / `Proposed` / `Validated` | abort before commit |
 | `Prepared` | reconcile before any retry decision |
 | `ReconciliationRequired` | reconcile again; never recommit |
-| `Committed` | re-establish/read back output, then verify or compensate |
+| `Committed` | re-establish/read back output, then verify; compensate only after explicit failure |
 | `RollbackPending` | verify whether compensation already completed; resume only if needed |
 | `Verified` | finalize without repeating the effect |
 | terminal state | no recovery action |
 
-`Prepared` carries a `RecoveryEnvelope` with action identity, idempotency identity, start time, compensation policy, and the serialized rollback snapshot.
+A prior `VerificationRequired` outcome maps naturally to the `Committed` recovery path.
+
+### Torn-tail-safe local logs
+
+`FileJournal` and `JsonlEvidenceStore` use newline-delimited frames:
+
+```text
+JSON bytes -> newline -> flush -> sync_data
+```
+
+The newline is the local frame-commit marker. On reopen, unterminated bytes after the last newline are treated as an interrupted, uncommitted tail and truncated. Earlier frames remain readable.
+
+Malformed **newline-terminated** JSON is not repaired or skipped. It is treated as committed corruption and readers fail closed.
+
+When a durable JSONL file is newly created, the file is synced and, on Unix, its parent directory is synced so the new directory entry is durable before subsequent frames are relied upon.
 
 ## Identity and idempotency
 
-Two identities are intentionally separated:
+Two identities are intentionally separate:
 
-- **Execution ID**: identity of this kernel execution.
-- **Idempotency key**: identity of the logical effect/request.
+- **Execution ID** — identity of this kernel execution.
+- **Idempotency key** — identity of the logical request/effect.
 
-Duplicate execution IDs fail closed. Duplicate idempotency keys do not silently cross the effect boundary again.
+Duplicate execution IDs fail closed. Duplicate idempotency keys do not silently cross the local effect boundary again. `FileIdempotencyStore` uses atomically created, fsync-backed claim files so local claims survive process restart.
 
-`InMemoryIdempotencyStore` is useful for tests and embedded use. `FileIdempotencyStore` uses atomically created claim files plus fsync so local claims survive process restart.
-
-This is a **local execution guarantee**, not a distributed exactly-once protocol. Remote exactly-once behavior still depends on the external system exposing stable identity, readback, or native idempotency semantics.
+This is a **local execution guarantee**, not a distributed exactly-once protocol. Remote exactly-once semantics still require stable remote identity, readback, native idempotency, or another appropriate protocol.
 
 ## Evidence model
 
-Every execution emits a machine-inspectable `ExecutionRecord` containing:
+Every execution emits a machine-inspectable `ExecutionRecord` containing identity, timestamps, transitions, validation, preconditions, invariants, commit disposition, reconciliation, verification, rollback, recovery metadata, typed failure, outcome, and a SHA-256 record seal.
 
-- execution, action, and idempotency identity;
-- start/completion timestamps;
-- state transitions;
-- validation and precondition results;
-- invariants before commit, after commit, and after rollback;
-- commit disposition;
-- reconciliation result;
-- verification result;
-- rollback result;
-- recovery metadata;
-- typed failure classification;
-- final outcome;
-- SHA-256 record seal.
+Schema version 3 adds explicit verification indeterminacy so evidence can distinguish "observed false" from "could not observe."
 
 ### Terminal-state ordering
 
-For K5, terminal durability is ordered as:
+K5 is enforced by ordering:
 
 ```text
 construct terminal transition in memory
@@ -338,31 +341,23 @@ construct terminal transition in memory
 -> return ExecutionResult
 ```
 
-If evidence persistence fails, the journal remains at a recoverable nonterminal head such as `Verified` or `RollbackPending`.
+If evidence persistence fails, the journal remains at a recoverable nonterminal head.
 
 ### Redaction
 
-`ConservativeRedactor` removes explicitly configured secret values plus values following common sensitive labels such as:
+`ConservativeRedactor` removes explicitly configured secret values plus values following common sensitive labels including `password=`, `token=`, `secret=`, `api_key=`, and `authorization=` before sealing/persistence.
 
-```text
-password=
-token=
-secret=
-api_key=
-authorization=
-```
-
-Recovery snapshots live in the journal rather than the evidence record. They may still contain sensitive application state and should be protected accordingly.
+Recovery snapshots live in the journal rather than the evidence record and may contain sensitive application state. Storage protection remains the caller's responsibility.
 
 ## Failure taxonomy
 
-The implementation avoids collapsing materially different failures into one generic error. Evidence distinguishes validation, precondition, snapshot, commit, unknown outcome, verification, invariant, rollback, compensation, reconciliation, recovery, evidence persistence, journal, execution identity, idempotency, and injected-fault failures.
+The implementation distinguishes materially different failure semantics: validation, precondition, snapshot, known/unknown commit, explicit/indeterminate verification, invariant, rollback failure, compensation unavailable, compensation conflict, reconciliation, recovery, evidence persistence, journal, execution identity, idempotency, and injected faults.
 
-That distinction matters because safe recovery depends on knowing **where uncertainty begins**.
+That distinction matters because safe recovery depends on knowing **where uncertainty begins and whether state ownership still exists**.
 
 ## Fault injection and adversarial testing
 
-The deterministic injector exposes all eight required lifecycle boundaries:
+The deterministic injector exposes all eight lifecycle boundaries:
 
 | Fault point | Expected safe interpretation |
 |---|---|
@@ -371,20 +366,24 @@ The deterministic injector exposes all eight required lifecycle boundaries:
 | `BeforeCommit` | prepared; reconcile before retry |
 | `DuringCommit` | prepared; effect uncertain; reconcile |
 | `AfterCommit` | prepared; effect may exist; reconcile |
-| `BeforeVerify` | committed; verify or compensate |
+| `BeforeVerify` | committed; recover and verify |
 | `DuringRollback` | rollback pending; resume/verify compensation |
 | `AfterRollback` | rollback pending; verify whether rollback already completed |
 
-The adversarial fake remote API additionally models:
+Hardening regressions additionally cover:
 
-- timeout before the effect is applied;
-- effect applied but response lost;
-- duplicate request;
-- partial external write;
-- conflicting remote state;
-- unresolved commit outcome.
+- verifier unavailable after a successful commit;
+- repeated verifier unavailability across recovery;
+- later verification success without a second commit;
+- later explicit failed verification followed by compensation;
+- torn final journal and evidence records;
+- committed malformed JSON failing closed;
+- appending after torn-tail repair;
+- explicit compensation conflict;
+- SQLite concurrent-state preservation;
+- atomic-file interference refusal.
 
-Property/model tests randomize lifecycle decisions and fault locations to check that safety invariants survive combinations beyond the hand-written cases.
+The adversarial fake remote API separately models timeout-before-apply, lost-response-after-apply, duplicate request, partial write, conflicting remote state, and unresolved outcomes. Property/model tests explore combinations beyond hand-written cases.
 
 ## Reference actions
 
@@ -392,23 +391,19 @@ The repository intentionally contains **exactly three** reference actions.
 
 | Example | What it demonstrates | Run |
 |---|---|---|
-| Atomic file replacement | snapshot, temp write, fsync, rename, hash verification, reconciliation, rollback | `cargo run --example atomic_file` |
-| SQLite mutation | optimistic version precondition, persisted-state verification, reconciliation, rollback | `cargo run --example sqlite` |
+| Atomic file replacement | snapshot, fsync, rename, hash verification, reconciliation, conflict-aware compensation | `cargo run --example atomic_file` |
+| SQLite mutation | optimistic version precondition, persisted-state verification, reconciliation, atomic conditional compensation | `cargo run --example sqlite` |
 | Unreliable remote API | timeout, duplicate request, lost response, partial write, uncertainty, reconciliation | `cargo run --example unreliable_api` |
 
 The goal is depth of semantics, not integration count.
 
 ## Benchmarks
 
-`benches/kernel.rs` measures three distinct costs:
+`benches/kernel.rs` measures:
 
 ```bash
 cargo bench --locked --bench kernel
 ```
-
-The harness emits explicit median/p95 samples in addition to Criterion's statistical report.
-
-### Reference evidence
 
 Reference run: GitHub Actions `ubuntu-24.04`, Rust stable 1.99.0, 2026-10-08.
 
@@ -422,7 +417,7 @@ Criterion from the same run reported approximately `7.23–7.32 µs`, `9.45–9.
 
 [View the benchmark/validation run](https://github.com/SaridakisStamatisChristos/Execution-Assurance-Microkernel/actions/runs/37857640762)
 
-These measurements are environment-specific observations, **not universal latency guarantees**. Shared-runner storage latency in particular can materially affect the fsync-backed path.
+These are environment-specific observations, **not universal latency guarantees**.
 
 ## Quality gates
 
@@ -445,10 +440,11 @@ The workflow has read-only repository permissions.
 ```text
 .
 ├── src/
-│   ├── action.rs          # Action contract, EffectPermit, compensation policy
+│   ├── action.rs          # Action contract, EffectPermit, RollbackStatus
 │   ├── kernel.rs          # lifecycle orchestration and recovery execution
 │   ├── state.rs           # explicit state machine
 │   ├── invariant.rs       # preconditions and invariant phases
+│   ├── durable_log.rs     # torn-tail-safe local JSONL opening/repair
 │   ├── journal.rs         # in-memory + fsync-backed execution journal
 │   ├── recovery.rs        # recovery classification/directives
 │   ├── idempotency.rs     # in-memory + durable local claims
@@ -461,6 +457,7 @@ The workflow has read-only repository permissions.
 │   └── unreliable_api.rs
 ├── tests/
 │   ├── lifecycle.rs
+│   ├── verification_uncertainty.rs
 │   ├── fault_injection.rs
 │   ├── recovery.rs
 │   ├── idempotency.rs
@@ -480,24 +477,13 @@ The workflow has read-only repository permissions.
 
 ## Documentation
 
-- [`docs/SPEC.md`](docs/SPEC.md) — formal execution contract and K1–K7 semantics.
-- [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) — legal transitions and durable recovery interpretation.
-- [`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md) — uncertainty, compensation, infrastructure failure, and fault semantics.
+- [`docs/SPEC.md`](docs/SPEC.md) — formal execution contract and K1–K10 semantics.
+- [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) — legal transitions, verification uncertainty, and durable recovery interpretation.
+- [`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md) — uncertainty, compensation conflict, persistence corruption, and fault semantics.
 
 ## Scope and non-goals
 
-This repository is deliberately **not**:
-
-- an agent framework or LLM runtime;
-- a workflow builder or orchestration platform;
-- a distributed transaction coordinator;
-- a distributed consensus protocol;
-- an authentication/authorization system;
-- a message broker;
-- a cloud platform;
-- a vector database;
-- a plugin system;
-- a web UI.
+This repository is deliberately **not** an agent framework, workflow builder, distributed transaction coordinator, consensus protocol, authentication system, message broker, cloud platform, vector database, plugin system, or web UI.
 
 Its claim stays narrow:
 
@@ -506,18 +492,19 @@ Its claim stays narrow:
 ### What it does not claim
 
 - **Distributed exactly-once execution.** Local durable claims do not replace remote idempotency or consensus.
-- **Cryptographic authenticity/non-repudiation.** The SHA-256 record seal detects mutation relative to its recorded digest; it is not a signature or external trust anchor.
-- **Encrypted persistence.** Journal snapshots may contain sensitive application data; storage protection is the caller's responsibility.
-- **Universal rollback.** Some real-world effects are inherently non-compensable; the kernel models that explicitly.
-- **Automatic application reconstruction.** Recovery reuses the matching `Action` implementation and caller-provided context; it does not serialize arbitrary Rust code or discover application resources.
+- **Distributed fencing or universal state ownership.** Conflict detection is adapter-specific; the file example cannot provide a filesystem CAS primitive.
+- **Cryptographic authenticity/non-repudiation.** The SHA-256 record seal detects mutation relative to its digest; it is not a signature or trust anchor.
+- **Encrypted persistence.** Journal snapshots may contain sensitive application data.
+- **Universal rollback.** Some effects are non-compensable and some compensations become unsafe after interference.
+- **Automatic application reconstruction.** Recovery reuses a matching `Action` and caller-provided context.
 
-The design prefers an explicit unresolved state over unsafe inference.
+The design prefers an explicit unresolved, indeterminate, or conflicted state over unsafe inference.
 
 ## Contributing
 
-Changes should preserve the project's defining constraint: **small surface area, strong semantics**.
+Changes should preserve the defining constraint: **small surface area, strong semantics**.
 
-Before opening a pull request, run the same checks as CI:
+Before opening a pull request:
 
 ```bash
 cargo fmt --all -- --check
@@ -528,7 +515,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo bench --locked --no-run
 ```
 
-For changes to execution semantics, add deterministic failure coverage and update the formal docs in the same change.
+Execution-semantic changes should add deterministic failure coverage and update the formal docs in the same change.
 
 ## License
 

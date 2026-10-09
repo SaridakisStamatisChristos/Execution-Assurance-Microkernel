@@ -4,6 +4,7 @@
 //! **a commit is not success; success requires a verified postcondition.**
 
 pub mod action;
+mod durable_log;
 pub mod error;
 pub mod evidence;
 pub mod fault;
@@ -14,7 +15,9 @@ pub mod kernel;
 pub mod recovery;
 pub mod state;
 
-pub use action::{Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult};
+pub use action::{
+    Action, CommitStatus, CompensationPolicy, EffectPermit, ReconciliationResult, RollbackStatus,
+};
 pub use error::{ExecutionError, FailureClass};
 pub use evidence::{
     CheckRecord, CommitDisposition, ConservativeRedactor, EvidenceRedactor, EvidenceStore,

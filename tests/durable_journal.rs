@@ -1,7 +1,10 @@
 use execution_assurance_microkernel::{
     ExecutionState, FileJournal, Journal, JournalEntry, RecoveryManager, RecoveryPlan,
 };
-use std::fs;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+};
 use uuid::Uuid;
 
 #[test]
@@ -62,5 +65,66 @@ fn recovery_uses_the_latest_durable_state_per_execution() {
     assert_eq!(b.plan, RecoveryPlan::CompleteRollback);
 
     drop(journal);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn torn_final_journal_frame_is_truncated_without_losing_committed_history() {
+    let path = std::env::temp_dir().join(format!("eamk-torn-journal-{}.jsonl", Uuid::new_v4()));
+    {
+        let journal = FileJournal::open(&path).unwrap();
+        journal
+            .append(JournalEntry::state("exec-1", ExecutionState::Prepared, 10))
+            .unwrap();
+        journal
+            .append(JournalEntry::state("exec-1", ExecutionState::Committed, 11))
+            .unwrap();
+    }
+
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(br#"{"execution_id":"exec-1","state":"ver"#)
+        .unwrap();
+
+    let repaired = FileJournal::open(&path).unwrap();
+    let entries = repaired.entries().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.last().unwrap().state, ExecutionState::Committed);
+
+    repaired
+        .append(JournalEntry::state("exec-1", ExecutionState::Verified, 12))
+        .unwrap();
+    drop(repaired);
+
+    let reopened = FileJournal::open(&path).unwrap();
+    let entries = reopened.entries().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.last().unwrap().state, ExecutionState::Verified);
+
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn malformed_newline_terminated_journal_frame_fails_closed() {
+    let path = std::env::temp_dir().join(format!("eamk-corrupt-journal-{}.jsonl", Uuid::new_v4()));
+    {
+        let journal = FileJournal::open(&path).unwrap();
+        journal
+            .append(JournalEntry::state("exec-1", ExecutionState::Prepared, 10))
+            .unwrap();
+    }
+
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{not-valid-json}\n")
+        .unwrap();
+
+    let reopened = FileJournal::open(&path).unwrap();
+    assert!(reopened.entries().is_err());
+
     fs::remove_file(path).unwrap();
 }

@@ -1,7 +1,7 @@
-use crate::{CompensationPolicy, ExecutionState};
+use crate::{durable_log::open_durable_jsonl, CompensationPolicy, ExecutionState};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -73,11 +73,7 @@ pub struct FileJournal {
 impl FileJournal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let file = open_durable_jsonl(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(file),

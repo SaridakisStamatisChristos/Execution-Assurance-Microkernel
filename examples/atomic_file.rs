@@ -1,6 +1,6 @@
 use execution_assurance_microkernel::{
     Action, CheckRecord, CommitStatus, EffectPermit, IdempotencyKey, Kernel, Predicate,
-    ReconciliationResult,
+    ReconciliationResult, RollbackStatus,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,6 +41,39 @@ impl AtomicReplace {
 
     fn hash(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn rollback_if_owned(&self, snapshot: &Option<Vec<u8>>) -> RollbackStatus<io::Error> {
+        match fs::read(&self.path) {
+            Ok(current) if current == self.replacement => {}
+            Ok(_) => {
+                return RollbackStatus::Conflict {
+                    reason:
+                        "target changed after commit; refusing to overwrite newer external state"
+                            .to_string(),
+                };
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return RollbackStatus::Conflict {
+                    reason: "target disappeared after commit; compensation ownership is lost"
+                        .to_string(),
+                };
+            }
+            Err(error) => return RollbackStatus::Failed(error),
+        }
+
+        let restored = match snapshot {
+            Some(bytes) => Self::replace(&self.path, bytes),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+        match restored {
+            Ok(()) => RollbackStatus::Succeeded,
+            Err(error) => RollbackStatus::Failed(error),
+        }
     }
 }
 
@@ -127,14 +160,20 @@ impl Action for AtomicReplace {
         _ctx: &mut (),
         snapshot: &Self::Snapshot,
     ) -> Result<(), Self::Error> {
-        match snapshot {
-            Some(bytes) => Self::replace(&self.path, bytes),
-            None => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            },
+        match self.rollback_if_owned(snapshot) {
+            RollbackStatus::Succeeded => Ok(()),
+            RollbackStatus::Failed(error) => Err(error),
+            RollbackStatus::Conflict { reason } => Err(io::Error::other(reason)),
         }
+    }
+
+    fn rollback_status(
+        &self,
+        _permit: &EffectPermit,
+        _ctx: &mut (),
+        snapshot: &Self::Snapshot,
+    ) -> RollbackStatus<Self::Error> {
+        self.rollback_if_owned(snapshot)
     }
 
     fn verify_rollback(
@@ -173,4 +212,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::remove_dir_all(root)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn compensation_refuses_to_overwrite_external_file_change() {
+        let root = std::env::temp_dir().join(format!("eamk-file-conflict-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"third-party").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+        let snapshot = Some(b"before".to_vec());
+
+        let status = action.rollback_if_owned(&snapshot);
+        assert!(matches!(status, RollbackStatus::Conflict { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"third-party");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compensation_restores_snapshot_when_committed_content_is_still_owned() {
+        let root = std::env::temp_dir().join(format!("eamk-file-owned-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"ours").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+        let snapshot = Some(b"before".to_vec());
+
+        let status = action.rollback_if_owned(&snapshot);
+        assert!(matches!(status, RollbackStatus::Succeeded));
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
