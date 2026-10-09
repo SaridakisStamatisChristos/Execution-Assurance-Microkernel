@@ -93,11 +93,13 @@ fn schema3_rollback_record_without_indeterminate_field_remains_decodable() {
 
     let decoded: execution_assurance_microkernel::ExecutionRecord =
         serde_json::from_value(value).unwrap();
-    assert!(!decoded
-        .rollback
-        .as_ref()
-        .unwrap()
-        .verification_indeterminate);
+    assert!(
+        !decoded
+            .rollback
+            .as_ref()
+            .unwrap()
+            .verification_indeterminate
+    );
 }
 
 #[test]
