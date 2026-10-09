@@ -71,6 +71,36 @@ fn jsonl_evidence_round_trips_as_machine_inspectable_data() {
 }
 
 #[test]
+fn schema3_rollback_record_without_indeterminate_field_remains_decodable() {
+    let mut world = World::default();
+    let record = basic_kernel()
+        .execute(
+            TestAction {
+                verify_ok: false,
+                ..TestAction::default()
+            },
+            &mut world,
+        )
+        .unwrap()
+        .record;
+
+    let mut value = serde_json::to_value(record).unwrap();
+    value["schema_version"] = serde_json::json!(3);
+    value["rollback"]
+        .as_object_mut()
+        .unwrap()
+        .remove("verification_indeterminate");
+
+    let decoded: execution_assurance_microkernel::ExecutionRecord =
+        serde_json::from_value(value).unwrap();
+    assert!(!decoded
+        .rollback
+        .as_ref()
+        .unwrap()
+        .verification_indeterminate);
+}
+
+#[test]
 fn raw_secrets_are_redacted_before_durable_evidence() {
     let mut world = World::default();
     let mut record = basic_kernel()
