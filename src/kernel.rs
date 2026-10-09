@@ -21,9 +21,10 @@ use crate::{
     state::{ExecutionState, ExecutionTrace},
 };
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -75,6 +76,39 @@ impl SequenceIdGenerator {
 impl IdGenerator for SequenceIdGenerator {
     fn next_id(&self) -> String {
         format!("exec-{}", self.next.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+static ACTIVE_RECOVERIES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct LocalRecoveryGuard {
+    execution_id: String,
+}
+
+impl LocalRecoveryGuard {
+    fn acquire(execution_id: &str) -> Result<Self, ExecutionError> {
+        let active = ACTIVE_RECOVERIES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut active = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(execution_id.to_string()) {
+            return Err(ExecutionError::RecoveryInProgress(execution_id.to_string()));
+        }
+        Ok(Self {
+            execution_id: execution_id.to_string(),
+        })
+    }
+}
+
+impl Drop for LocalRecoveryGuard {
+    fn drop(&mut self) {
+        if let Some(active) = ACTIVE_RECOVERIES.get() {
+            let mut active = active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active.remove(&self.execution_id);
+        }
     }
 }
 
@@ -218,11 +252,29 @@ impl Kernel {
         action: A,
         ctx: &mut A::Context,
     ) -> Result<ExecutionResult<A::Output>, ExecutionError> {
+        // Recovery ownership is process-local: concurrent recoveries for the
+        // same execution fail closed before reading evidence or invoking action
+        // hooks. Cross-process/distributed fencing remains an external concern.
+        let _recovery_guard = LocalRecoveryGuard::acquire(execution_id)?;
+
         if let Some(existing) = self
             .evidence
             .find(execution_id)
             .map_err(ExecutionError::EvidencePersistence)?
         {
+            match existing.verify_hash() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ExecutionError::EvidenceIntegrity(format!(
+                        "execution {execution_id} has missing or invalid evidence seal"
+                    )));
+                }
+                Err(error) => {
+                    return Err(ExecutionError::EvidenceIntegrity(format!(
+                        "execution {execution_id} evidence seal could not be verified: {error}"
+                    )));
+                }
+            }
             if existing
                 .transitions
                 .last()

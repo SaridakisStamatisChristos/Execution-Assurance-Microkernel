@@ -29,7 +29,23 @@ struct AtomicReplace {
 }
 
 impl AtomicReplace {
-    fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    fn sync_parent(path: &Path) -> io::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target has no parent directory",
+            )
+        })?;
+        fs::File::open(parent)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_parent(_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_and_rename(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let tmp = path.with_extension("execution-microkernel.tmp");
         let mut options = fs::OpenOptions::new();
         use std::io::Write;
@@ -37,6 +53,30 @@ impl AtomicReplace {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(tmp, path)
+    }
+
+    fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        Self::write_and_rename(path, bytes)?;
+        Self::sync_parent(path)
+    }
+
+    fn commit_replace_with<F>(&self, sync_parent: F) -> CommitStatus<String, io::Error>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
+        if let Err(error) = Self::write_and_rename(&self.path, &self.replacement) {
+            return CommitStatus::Failed(error);
+        }
+
+        let output = Self::hash(&self.replacement);
+        match sync_parent(&self.path) {
+            Ok(()) => CommitStatus::Confirmed(output),
+            Err(error) => CommitStatus::Unknown {
+                reason: format!(
+                    "replacement is visible but parent-directory durability could not be established: {error}"
+                ),
+            },
+        }
     }
 
     fn hash(bytes: &[u8]) -> String {
@@ -65,7 +105,7 @@ impl AtomicReplace {
         let restored = match snapshot {
             Some(bytes) => Self::replace(&self.path, bytes),
             None => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
+                Ok(()) => Self::sync_parent(&self.path),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             },
@@ -118,10 +158,7 @@ impl Action for AtomicReplace {
         _permit: &EffectPermit,
         _ctx: &mut (),
     ) -> CommitStatus<Self::Output, Self::Error> {
-        match Self::replace(&self.path, &self.replacement) {
-            Ok(()) => CommitStatus::Confirmed(Self::hash(&self.replacement)),
-            Err(error) => CommitStatus::Failed(error),
-        }
+        self.commit_replace_with(Self::sync_parent)
     }
 
     fn reconcile(
@@ -253,6 +290,42 @@ mod tests {
         let status = action.rollback_if_owned(&snapshot);
         assert!(matches!(status, RollbackStatus::Succeeded));
         assert_eq!(fs::read(&path).unwrap(), b"before");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_committed_file_completes_compensation() {
+        let root = std::env::temp_dir().join(format!("eamk-file-remove-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"ours").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+
+        let status = action.rollback_if_owned(&None);
+        assert!(matches!(status, RollbackStatus::Succeeded));
+        assert!(!path.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_sync_failure_after_rename_is_unknown_not_failed() {
+        let root = std::env::temp_dir().join(format!("eamk-file-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.txt");
+        fs::write(&path, b"before").unwrap();
+        let action = AtomicReplace {
+            path: path.clone(),
+            replacement: b"ours".to_vec(),
+        };
+
+        let status = action.commit_replace_with(|_| Err(io::Error::other("sync failed")));
+        assert!(matches!(status, CommitStatus::Unknown { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
 
         fs::remove_dir_all(root).unwrap();
     }
